@@ -67,7 +67,7 @@ where
                 let incoming_task = incoming_task(
                     client_id.clone(),
                     incoming,
-                    broker_handle,
+                    broker_handle.clone(),
                     connection_handle,
                 );
                 let outgoing_task = outgoing_task(events, outgoing);
@@ -75,8 +75,32 @@ where
                 pin_mut!(outgoing_task);
 
                 match select(incoming_task, outgoing_task).await {
-                    Either::Left((res, _)) => debug!("incoming finished with: {:?}", res),
-                    Either::Right((res, _)) => debug!("outgoing finished with: {:?}", res),
+                    Either::Left((Ok(()), out)) => {
+                        debug!("incoming_task finished with ok. waiting for outgoing_task to complete...");
+                        out.await?;
+                        debug!("outgoing_task completed.");
+                    },
+                    Either::Left((Err(_e), out)) => {
+                        // incoming packet stream completed with an error
+                        // send a DropConnection request to the broker and wait for the outgoing
+                        // task to drain
+                        debug!("incoming_task finished with an error. sending drop connection request to broker");
+                        let msg = Message::new(client_id.clone(), Event::DropConnection);
+                        broker_handle.send(msg).await?;
+
+                        debug!("waiting for outgoing_task to complete...");
+                        out.await?;
+                        debug!("outgoing_task completed.");
+                    },
+                    Either::Right((Ok(()), _)) => debug!("outgoing finished with ok"),
+                    Either::Right((Err(_e), _)) => {
+                        // outgoing task failed with an error.
+                        // Notify the broker that the connection is gone and close the connection
+
+                        debug!("outgoing_task finished with an error. notifying the broker to remove the connection");
+                        let msg = Message::new(client_id.clone(), Event::DropConnection);
+                        broker_handle.send(msg).await?;
+                    },
                 }
 
                 info!("closing connection");
@@ -107,6 +131,13 @@ where
                 debug!("incoming: {:?}", packet);
                 let event = match packet {
                     Packet::Connect(connect) => Event::Connect(connect, connection.clone()),
+                    Packet::Disconnect(disconnect) => {
+                        let event = Event::Disconnect(disconnect);
+                        let message = Message::new(client_id.clone(), event);
+                        broker.send(message).await?;
+                        debug!("disconnect received. shutting down receive side of connection");
+                        return Ok(());
+                    }
                     _ => Event::Unknown,
                 };
 
@@ -114,12 +145,16 @@ where
                 broker.send(message).await?;
             }
             Err(e) => {
-                warn!(message="error from stream: {:?}", %e);
+                warn!(message="error from stream", error=%e);
                 return Err(e.context(ErrorKind::DecodePacket).into());
             }
         }
     }
-    debug!("incoming_task complete");
+
+    debug!("no more packets. sending DropConnection to broker.");
+    let message = Message::new(client_id.clone(), Event::DropConnection);
+    broker.send(message).await?;
+    debug!("incoming_task completing...");
     Ok(())
 }
 
@@ -131,15 +166,19 @@ where
     while let Some(message) = messages.recv().await {
         debug!("outgoing: {:?}", message);
         match message.into_event() {
-            Event::ConnAck(connack) => outgoing
-                .send(Packet::ConnAck(connack))
-                .await
-                .context(ErrorKind::EncodePacket)?,
+            Event::ConnAck(connack) => {
+                outgoing
+                    .send(Packet::ConnAck(connack))
+                    .await
+                    .context(ErrorKind::EncodePacket)?;
+                debug!("sent packet to client");
+            }
+            Event::Disconnect(_) => return Ok(()),
+            Event::DropConnection => return Ok(()),
             _ => (),
         }
-        debug!("sent packet to client");
     }
-    debug!("outgoing_task complete");
+    debug!("outgoing_task completing...");
     Ok(())
 }
 

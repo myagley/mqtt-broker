@@ -30,9 +30,19 @@ impl fmt::Display for ClientId {
 
 #[derive(Debug)]
 pub enum Event {
+    /// Connect request
     Connect(Connect, ConnectionHandle),
+
+    /// Connect response
     ConnAck(ConnAck),
-    Gone,
+
+    /// Graceful disconnect request
+    Disconnect(Disconnect),
+
+    /// Non-graceful disconnect request,
+    DropConnection,
+
+    /// Unknown event
     Unknown,
 }
 
