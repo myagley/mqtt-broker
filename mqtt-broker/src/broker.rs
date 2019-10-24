@@ -1,6 +1,8 @@
 use failure::ResultExt;
 use mqtt::proto::*;
 use tokio::sync::mpsc::{self, Receiver, Sender};
+use tracing::{debug, info, span, warn, Level};
+use tracing_futures::Instrument;
 
 use crate::{Error, ErrorKind, Event, Message};
 
@@ -19,23 +21,33 @@ impl Broker {
         BrokerHandle(self.sender.clone())
     }
 
-    pub async fn run(mut self) {
+    pub async fn run(mut self) -> Result<(), Error> {
         while let Some(message) = self.messages.recv().await {
-            let client_id = message.client_id().clone();
-            match message.into_event() {
-                Event::Connect(_conn, mut handle) => {
-                    let ack = ConnAck {
-                        session_present: false,
-                        return_code: ConnectReturnCode::Accepted,
-                    };
-                    let event = Event::ConnAck(ack);
-                    if let Err(e) = handle.send(Message::new(client_id, event)).await {
-                        println!("error sending to connection handle: {}", e);
-                    }
-                }
-                _ => (),
-            }
+            let span = span!(Level::INFO, "broker", client_id=%message.client_id());
+            self.handle_message(message).instrument(span).await?
         }
+        info!("broker task exiting");
+        Ok(())
+    }
+
+    async fn handle_message(&mut self, message: Message) -> Result<(), Error> {
+        let client_id = message.client_id().clone();
+        match message.into_event() {
+            Event::Connect(_conn, mut handle) => {
+                debug!("received connect");
+                let ack = ConnAck {
+                    session_present: false,
+                    return_code: ConnectReturnCode::Accepted,
+                };
+                let event = Event::ConnAck(ack);
+                debug!("sending connack");
+                if let Err(e) = handle.send(Message::new(client_id, event)).await {
+                    warn!(message = "error sending message to connection handle", %e);
+                }
+            }
+            _ => (),
+        }
+        Ok(())
     }
 }
 

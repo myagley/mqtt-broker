@@ -1,3 +1,4 @@
+use std::fmt;
 use std::sync::Arc;
 
 use mqtt::proto::*;
@@ -18,6 +19,12 @@ pub struct ClientId(Arc<String>);
 impl ClientId {
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl fmt::Display for ClientId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_str())
     }
 }
 

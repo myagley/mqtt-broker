@@ -9,6 +9,8 @@ use mqtt::proto::{self, DecodeError, EncodeError, Packet, PacketCodec};
 use tokio::codec::Framed;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc::{self, Receiver, Sender};
+use tracing::{debug, info, span, warn, Level};
+use tracing_futures::Instrument;
 use uuid::Uuid;
 
 use crate::broker::BrokerHandle;
@@ -48,33 +50,40 @@ where
 
     match incoming.next().await {
         Some(Ok(Packet::Connect(connect))) => {
-            let (sender, events) = mpsc::channel(128);
-            let connection_handle = ConnectionHandle(sender);
-
-            // Send the connect event to the broker
             let client_id = client_id(&connect.client_id);
-            let event = Event::Connect(connect, connection_handle.clone());
-            let message = Message::new(client_id.clone(), event);
-            broker_handle.send(message).await?;
+            let span = span!(Level::INFO, "connection", client_id=%client_id);
 
-            // Start up the processing tasks
-            let incoming_task = incoming_task(
-                client_id.clone(),
-                incoming,
-                broker_handle,
-                connection_handle,
-            );
-            let outgoing_task = outgoing_task(events, outgoing);
-            pin_mut!(incoming_task);
-            pin_mut!(outgoing_task);
+            // async block to attach instrumentation context
+            async {
+                info!("new client connection");
 
-            match select(incoming_task, outgoing_task).await {
-                Either::Left((res, _)) => println!("incoming finished with: {:?}", res),
-                Either::Right((res, _)) => println!("outgoing finished with: {:?}", res),
+                let (sender, events) = mpsc::channel(128);
+                let connection_handle = ConnectionHandle(sender);
+                let event = Event::Connect(connect, connection_handle.clone());
+                let message = Message::new(client_id.clone(), event);
+                broker_handle.send(message).await?;
+
+                // Start up the processing tasks
+                let incoming_task = incoming_task(
+                    client_id.clone(),
+                    incoming,
+                    broker_handle,
+                    connection_handle,
+                );
+                let outgoing_task = outgoing_task(events, outgoing);
+                pin_mut!(incoming_task);
+                pin_mut!(outgoing_task);
+
+                match select(incoming_task, outgoing_task).await {
+                    Either::Left((res, _)) => debug!("incoming finished with: {:?}", res),
+                    Either::Right((res, _)) => debug!("outgoing finished with: {:?}", res),
+                }
+
+                info!("closing connection");
+                Ok(())
             }
-
-            println!("closing connection");
-            Ok(())
+                .instrument(span)
+                .await
         }
         Some(Ok(packet)) => Err(ErrorKind::NoConnect(packet).into()),
         Some(Err(e)) => Err(e.context(ErrorKind::DecodePacket).into()),
@@ -91,10 +100,11 @@ async fn incoming_task<S>(
 where
     S: Stream<Item = Result<Packet, DecodeError>> + Unpin,
 {
+    debug!("incoming_task start");
     while let Some(maybe_packet) = incoming.next().await {
         match maybe_packet {
             Ok(packet) => {
-                println!("incoming: {:?}", packet);
+                debug!("incoming: {:?}", packet);
                 let event = match packet {
                     Packet::Connect(connect) => Event::Connect(connect, connection.clone()),
                     _ => Event::Unknown,
@@ -104,12 +114,12 @@ where
                 broker.send(message).await?;
             }
             Err(e) => {
-                println!("error from stream: {:?}", e);
+                warn!(message="error from stream: {:?}", %e);
                 return Err(e.context(ErrorKind::DecodePacket).into());
             }
         }
     }
-    println!("no more frames");
+    debug!("incoming_task complete");
     Ok(())
 }
 
@@ -117,8 +127,9 @@ async fn outgoing_task<S>(mut messages: Receiver<Message>, mut outgoing: S) -> R
 where
     S: Sink<Packet, Error = EncodeError> + Unpin,
 {
+    debug!("outgoing_task start");
     while let Some(message) = messages.recv().await {
-        println!("outgoing: {:?}", message);
+        debug!("outgoing: {:?}", message);
         match message.into_event() {
             Event::ConnAck(connack) => outgoing
                 .send(Packet::ConnAck(connack))
@@ -126,7 +137,9 @@ where
                 .context(ErrorKind::EncodePacket)?,
             _ => (),
         }
+        debug!("sent packet to client");
     }
+    debug!("outgoing_task complete");
     Ok(())
 }
 
