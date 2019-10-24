@@ -1,6 +1,7 @@
 use std::fmt;
 
 use failure::{Backtrace, Context, Fail};
+use mqtt::proto::Packet;
 
 #[derive(Debug)]
 pub struct Error {
@@ -12,11 +13,11 @@ pub enum ErrorKind {
     #[fail(display = "An error occurred trying to connect.")]
     Connect,
 
-    #[fail(display = "An error occurred sending an event to the broker.")]
-    SendBrokerEvent,
+    #[fail(display = "An error occurred sending a message to the broker.")]
+    SendBrokerMessage,
 
-    #[fail(display = "An error occurred sending an event to a connection.")]
-    SendConnectionEvent,
+    #[fail(display = "An error occurred sending a message to a connection.")]
+    SendConnectionMessage,
 
     #[fail(display = "An error occurred binding the server's listening socket.")]
     BindServer,
@@ -26,6 +27,15 @@ pub enum ErrorKind {
 
     #[fail(display = "An error occurred encoding a packet.")]
     EncodePacket,
+
+    #[fail(
+        display = "Expected CONNECT packet as first packet, received somethig {:?}",
+        _0
+    )]
+    NoConnect(Packet),
+
+    #[fail(display = "Connection closed before any packets received.")]
+    NoPackets,
 }
 
 impl Fail for Error {

@@ -11,5 +11,6 @@ failure = "0.1"
 futures-util-preview = "0.3.0-alpha.19"
 tokio = "0.2.0-alpha.6"
 tokio-net = "0.2.0-alpha.6"
+uuid = { version = "0.8", features = ["v4"] }
 
 mqtt = { git = "https://github.com/myagley/mqtt", branch = "v0.2.x" }
