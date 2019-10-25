@@ -10,7 +10,7 @@ use mqtt::proto::{self, DecodeError, EncodeError, Packet, PacketCodec};
 use tokio::codec::Framed;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc::{self, Receiver, Sender};
-use tracing::{debug, info, span, warn, Level};
+use tracing::{debug, info, span, trace, warn, Level};
 use tracing_futures::Instrument;
 use uuid::Uuid;
 
@@ -97,32 +97,42 @@ where
                 match select(incoming_task, outgoing_task).await {
                     Either::Left((Ok(()), out)) => {
                         debug!("incoming_task finished with ok. waiting for outgoing_task to complete...");
-                        out.await?;
+                        out.await.map_err(|(_, e)| e)?;
                         debug!("outgoing_task completed.");
                     }
-                    Either::Left((Err(_e), out)) => {
+                    Either::Left((Err(e), out)) => {
                         // incoming packet stream completed with an error
                         // send a DropConnection request to the broker and wait for the outgoing
                         // task to drain
-                        debug!("incoming_task finished with an error. sending drop connection request to broker");
+                        debug!(message = "incoming_task finished with an error. sending drop connection request to broker", error=%e);
                         let msg = Message::new(client_id.clone(), Event::DropConnection);
                         broker_handle.send(msg).await?;
 
                         debug!("waiting for outgoing_task to complete...");
-                        out.await?;
+                        out.await.map_err(|(_, e)| e)?;
                         debug!("outgoing_task completed.");
                     }
-                    Either::Right((Ok(()), _)) => debug!("outgoing finished with ok"),
-                    Either::Right((Err(_e), _)) => {
+                    Either::Right((Ok(()), inc)) => {
+                        drop(inc);
+                        debug!("outgoing finished with ok")
+                    }
+                    Either::Right((Err((mut recv, e)), inc)) => {
                         // outgoing task failed with an error.
-                        // Notify the broker that the connection is gone and close the connection
+                        // drop the incoming packet processing
+                        // Notify the broker that the connection is gone, drain the receiver, and
+                        // close the connection
 
-                        debug!("outgoing_task finished with an error. notifying the broker to remove the connection");
+                        drop(inc);
+
+                        debug!(message = "outgoing_task finished with an error. notifying the broker to remove the connection", %e);
                         let msg = Message::new(client_id.clone(), Event::CloseSession);
                         broker_handle.send(msg).await?;
 
-                        // TODO: should probably return the message receiver and drain it so that
-                        // there aren't errors in the broker
+                        debug!("draining message receiver for connection...");
+                        while let Some(message) = recv.recv().await {
+                            trace!("dropping {:?}", message);
+                        }
+                        debug!("message receiver draining completed.");
                     }
                 }
 
@@ -169,7 +179,7 @@ where
                 broker.send(message).await?;
             }
             Err(e) => {
-                warn!(message="error from stream", error=%e);
+                warn!(message="error occurred while reading from connection", error=%e);
                 return Err(e.context(ErrorKind::DecodePacket).into());
             }
         }
@@ -182,21 +192,19 @@ where
     Ok(())
 }
 
-async fn outgoing_task<S>(mut messages: Receiver<Message>, mut outgoing: S) -> Result<(), Error>
+async fn outgoing_task<S>(
+    mut messages: Receiver<Message>,
+    mut outgoing: S,
+) -> Result<(), (Receiver<Message>, Error)>
 where
     S: Sink<Packet, Error = EncodeError> + Unpin,
 {
     debug!("outgoing_task start");
     while let Some(message) = messages.recv().await {
         debug!("outgoing: {:?}", message);
-        match message.into_event() {
-            Event::ConnAck(connack) => {
-                outgoing
-                    .send(Packet::ConnAck(connack))
-                    .await
-                    .context(ErrorKind::EncodePacket)?;
-                debug!("sent packet to client");
-            }
+        let maybe_packet = match message.into_event() {
+            Event::Connect(_, _) => None,
+            Event::ConnAck(connack) => Some(Packet::ConnAck(connack)),
             Event::Disconnect(_) => {
                 debug!("asked to disconnect. outgoing_task completing...");
                 return Ok(());
@@ -205,7 +213,19 @@ where
                 debug!("asked to drop connection. outgoing_task completing...");
                 return Ok(());
             }
-            _ => (),
+            Event::CloseSession => None,
+            Event::PingReq(_) => None,
+            Event::PingResp(response) => Some(Packet::PingResp(response)),
+            Event::Unknown => None,
+        };
+
+        if let Some(packet) = maybe_packet {
+            let result = outgoing.send(packet).await.context(ErrorKind::EncodePacket);
+
+            if let Err(e) = result {
+                warn!(message = "error occurred while writing to connection", error=%e);
+                return Err((messages, e.into()));
+            }
         }
     }
     debug!("outgoing_task completing...");
