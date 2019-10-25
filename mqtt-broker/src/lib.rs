@@ -13,7 +13,7 @@ pub use crate::connection::ConnectionHandle;
 pub use crate::error::{Error, ErrorKind};
 pub use crate::server::Server;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ClientId(Arc<String>);
 
 impl ClientId {
@@ -25,6 +25,12 @@ impl ClientId {
 impl fmt::Display for ClientId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.as_str())
+    }
+}
+
+impl From<String> for ClientId {
+    fn from(s: String) -> ClientId {
+        ClientId(Arc::new(s))
     }
 }
 
@@ -41,6 +47,9 @@ pub enum Event {
 
     /// Non-graceful disconnect request,
     DropConnection,
+
+    /// Close session - connection is already closed but session needs clean up
+    CloseSession,
 
     /// Unknown event
     Unknown,

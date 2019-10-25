@@ -28,10 +28,7 @@ pub enum ErrorKind {
     #[fail(display = "An error occurred encoding a packet.")]
     EncodePacket,
 
-    #[fail(
-        display = "Expected CONNECT packet as first packet, received somethig {:?}",
-        _0
-    )]
+    #[fail(display = "Expected CONNECT packet as first packet, received {:?}", _0)]
     NoConnect(Packet),
 
     #[fail(display = "Connection closed before any packets received.")]

@@ -1,3 +1,4 @@
+use std::fmt;
 use std::sync::Arc;
 
 use failure::{Fail, ResultExt};
@@ -17,15 +18,38 @@ use crate::broker::BrokerHandle;
 use crate::{ClientId, Error, ErrorKind, Event, Message};
 
 #[derive(Clone, Debug)]
-pub struct ConnectionHandle(Sender<Message>);
+pub struct ConnectionHandle {
+    id: Uuid,
+    sender: Sender<Message>,
+}
 
 impl ConnectionHandle {
+    pub(crate) fn new(id: Uuid, sender: Sender<Message>) -> Self {
+        Self { id, sender }
+    }
+
+    pub fn from_sender(sender: Sender<Message>) -> Self {
+        Self::new(Uuid::new_v4(), sender)
+    }
+
     pub async fn send(&mut self, message: Message) -> Result<(), Error> {
-        self.0
+        self.sender
             .send(message)
             .await
             .context(ErrorKind::SendConnectionMessage)?;
         Ok(())
+    }
+}
+
+impl PartialEq for ConnectionHandle {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl fmt::Display for ConnectionHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.id)
     }
 }
 
@@ -51,25 +75,21 @@ where
     match incoming.next().await {
         Some(Ok(Packet::Connect(connect))) => {
             let client_id = client_id(&connect.client_id);
-            let span = span!(Level::INFO, "connection", client_id=%client_id);
+            let (sender, events) = mpsc::channel(128);
+            let connection_handle = ConnectionHandle::from_sender(sender);
+            let span = span!(Level::INFO, "connection", client_id=%client_id, connection=%connection_handle);
 
             // async block to attach instrumentation context
             async {
                 info!("new client connection");
 
-                let (sender, events) = mpsc::channel(128);
-                let connection_handle = ConnectionHandle(sender);
                 let event = Event::Connect(connect, connection_handle.clone());
                 let message = Message::new(client_id.clone(), event);
                 broker_handle.send(message).await?;
 
                 // Start up the processing tasks
-                let incoming_task = incoming_task(
-                    client_id.clone(),
-                    incoming,
-                    broker_handle.clone(),
-                    connection_handle,
-                );
+                let incoming_task =
+                    incoming_task(client_id.clone(), incoming, broker_handle.clone(), connection_handle);
                 let outgoing_task = outgoing_task(events, outgoing);
                 pin_mut!(incoming_task);
                 pin_mut!(outgoing_task);
@@ -79,7 +99,7 @@ where
                         debug!("incoming_task finished with ok. waiting for outgoing_task to complete...");
                         out.await?;
                         debug!("outgoing_task completed.");
-                    },
+                    }
                     Either::Left((Err(_e), out)) => {
                         // incoming packet stream completed with an error
                         // send a DropConnection request to the broker and wait for the outgoing
@@ -91,16 +111,19 @@ where
                         debug!("waiting for outgoing_task to complete...");
                         out.await?;
                         debug!("outgoing_task completed.");
-                    },
+                    }
                     Either::Right((Ok(()), _)) => debug!("outgoing finished with ok"),
                     Either::Right((Err(_e), _)) => {
                         // outgoing task failed with an error.
                         // Notify the broker that the connection is gone and close the connection
 
                         debug!("outgoing_task finished with an error. notifying the broker to remove the connection");
-                        let msg = Message::new(client_id.clone(), Event::DropConnection);
+                        let msg = Message::new(client_id.clone(), Event::CloseSession);
                         broker_handle.send(msg).await?;
-                    },
+
+                        // TODO: should probably return the message receiver and drain it so that
+                        // there aren't errors in the broker
+                    }
                 }
 
                 info!("closing connection");
@@ -173,8 +196,14 @@ where
                     .context(ErrorKind::EncodePacket)?;
                 debug!("sent packet to client");
             }
-            Event::Disconnect(_) => return Ok(()),
-            Event::DropConnection => return Ok(()),
+            Event::Disconnect(_) => {
+                debug!("asked to disconnect. outgoing_task completing...");
+                return Ok(());
+            }
+            Event::DropConnection => {
+                debug!("asked to drop connection. outgoing_task completing...");
+                return Ok(());
+            }
             _ => (),
         }
     }
