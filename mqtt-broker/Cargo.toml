@@ -11,5 +11,13 @@ failure = "0.1"
 futures-util-preview = "0.3.0-alpha.19"
 tokio = "0.2.0-alpha.6"
 tokio-net = "0.2.0-alpha.6"
+tracing = "0.1"
+tracing-futures = { git = "https://github.com/tokio-rs/tracing", tag="tracing-0.1.10", default-features = false, features = ["std-future"] }
+uuid = { version = "0.8", features = ["v4"] }
 
 mqtt = { git = "https://github.com/myagley/mqtt", branch = "v0.2.x" }
+
+[dev-dependencies]
+atty = "0.2"
+matches = "0.1"
+tracing-subscriber = "0.1"

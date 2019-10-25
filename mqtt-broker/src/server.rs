@@ -2,8 +2,11 @@ use std::fmt::Display;
 
 use failure::ResultExt;
 use futures_util::stream::StreamExt;
+use futures_util::FutureExt;
 use tokio::net::TcpListener;
 use tokio_net::ToSocketAddrs;
+use tracing::{debug, info, span, trace, warn, Level};
+use tracing_futures::Instrument;
 
 use crate::broker::Broker;
 use crate::{connection, Error, ErrorKind};
@@ -25,20 +28,28 @@ impl Server {
     {
         let Server { broker } = self;
         let handle = broker.handle();
+        let span = span!(Level::INFO, "server", listener=%addr);
+        let _enter = span.enter();
 
         let mut incoming = TcpListener::bind(&addr)
             .await
             .context(ErrorKind::BindServer)?
             .incoming();
-        println!("Listening on port: {}", addr);
+        info!("Listening on address {}", addr);
 
-        tokio::spawn(broker.run());
+        // TODO: handle the broker returning an error.
+        // TODO: handle server graceful shutdown
+        tokio::spawn(broker.run().map(drop));
 
         while let Some(Ok(stream)) = incoming.next().await {
             let broker_handle = handle.clone();
+            let span = span.clone();
             tokio::spawn(async move {
-                if let Err(e) = connection::process(stream, broker_handle).await {
-                    println!("failed to process connection; error = {}", e);
+                if let Err(e) = connection::process(stream, broker_handle)
+                    .instrument(span)
+                    .await
+                {
+                    warn!(message = "failed to process connection", error=%e);
                 }
             });
         }

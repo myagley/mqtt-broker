@@ -1,54 +1,155 @@
+use std::fmt;
+use std::sync::Arc;
+
 use failure::{Fail, ResultExt};
 use futures_util::future::{select, Either};
 use futures_util::pin_mut;
 use futures_util::sink::{Sink, SinkExt};
 use futures_util::stream::{Stream, StreamExt};
-use mqtt::proto::{DecodeError, EncodeError, Packet, PacketCodec};
+use mqtt::proto::{self, DecodeError, EncodeError, Packet, PacketCodec};
 use tokio::codec::Framed;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc::{self, Receiver, Sender};
+use tracing::{debug, info, span, trace, warn, Level};
+use tracing_futures::Instrument;
+use uuid::Uuid;
 
 use crate::broker::BrokerHandle;
-use crate::{Error, ErrorKind, Event};
+use crate::{ClientId, Error, ErrorKind, Event, Message};
 
 #[derive(Clone, Debug)]
-pub struct ConnectionHandle(Sender<Event>);
+pub struct ConnectionHandle {
+    id: Uuid,
+    sender: Sender<Message>,
+}
 
 impl ConnectionHandle {
-    pub async fn send(&mut self, event: Event) -> Result<(), Error> {
-        self.0
-            .send(event)
+    pub(crate) fn new(id: Uuid, sender: Sender<Message>) -> Self {
+        Self { id, sender }
+    }
+
+    pub fn from_sender(sender: Sender<Message>) -> Self {
+        Self::new(Uuid::new_v4(), sender)
+    }
+
+    pub async fn send(&mut self, message: Message) -> Result<(), Error> {
+        self.sender
+            .send(message)
             .await
-            .context(ErrorKind::SendConnectionEvent)?;
+            .context(ErrorKind::SendConnectionMessage)?;
         Ok(())
     }
 }
 
-pub async fn process<I>(io: I, broker_handle: BrokerHandle) -> Result<(), Error>
+impl PartialEq for ConnectionHandle {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl fmt::Display for ConnectionHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.id)
+    }
+}
+
+/// Handles packet processing for a single connection.
+///
+/// Receives a source of packets and a handle to the Broker.
+/// Starts two tasks (sending and receiving)
+pub async fn process<I>(io: I, mut broker_handle: BrokerHandle) -> Result<(), Error>
 where
     I: AsyncRead + AsyncWrite + Unpin,
 {
     let codec = Framed::new(io, PacketCodec::default());
-    let (outgoing, incoming) = codec.split();
+    let (outgoing, mut incoming) = codec.split();
 
-    let (sender, events) = mpsc::channel(128);
-    let connection_handle = ConnectionHandle(sender);
+    // [MQTT-3.1.0-1] - After a Network Connection is established by a Client to a Server,
+    // the first Packet sent from the Client to the Server MUST be a CONNECT Packet.
+    //
+    // We need to handle the first CONNECT packet here (instead of in the broker state machine)
+    // so that we can get and cache the client_id for use with other packets.
+    // The broker state machine will also have to handle not receiving a connect packet first
+    // to keep the state machine correct.
 
-    let incoming = incoming_task(incoming, broker_handle, connection_handle);
-    let outgoing = outgoing_task(events, outgoing);
-    pin_mut!(incoming);
-    pin_mut!(outgoing);
+    match incoming.next().await {
+        Some(Ok(Packet::Connect(connect))) => {
+            let client_id = client_id(&connect.client_id);
+            let (sender, events) = mpsc::channel(128);
+            let connection_handle = ConnectionHandle::from_sender(sender);
+            let span = span!(Level::INFO, "connection", client_id=%client_id, connection=%connection_handle);
 
-    match select(incoming, outgoing).await {
-        Either::Left((res, _)) => println!("incoming finished with: {:?}", res),
-        Either::Right((res, _)) => println!("outgoing finished with: {:?}", res),
+            // async block to attach instrumentation context
+            async {
+                info!("new client connection");
+
+                let event = Event::Connect(connect, connection_handle.clone());
+                let message = Message::new(client_id.clone(), event);
+                broker_handle.send(message).await?;
+
+                // Start up the processing tasks
+                let incoming_task =
+                    incoming_task(client_id.clone(), incoming, broker_handle.clone(), connection_handle);
+                let outgoing_task = outgoing_task(events, outgoing);
+                pin_mut!(incoming_task);
+                pin_mut!(outgoing_task);
+
+                match select(incoming_task, outgoing_task).await {
+                    Either::Left((Ok(()), out)) => {
+                        debug!("incoming_task finished with ok. waiting for outgoing_task to complete...");
+                        out.await.map_err(|(_, e)| e)?;
+                        debug!("outgoing_task completed.");
+                    }
+                    Either::Left((Err(e), out)) => {
+                        // incoming packet stream completed with an error
+                        // send a DropConnection request to the broker and wait for the outgoing
+                        // task to drain
+                        debug!(message = "incoming_task finished with an error. sending drop connection request to broker", error=%e);
+                        let msg = Message::new(client_id.clone(), Event::DropConnection);
+                        broker_handle.send(msg).await?;
+
+                        debug!("waiting for outgoing_task to complete...");
+                        out.await.map_err(|(_, e)| e)?;
+                        debug!("outgoing_task completed.");
+                    }
+                    Either::Right((Ok(()), inc)) => {
+                        drop(inc);
+                        debug!("outgoing finished with ok")
+                    }
+                    Either::Right((Err((mut recv, e)), inc)) => {
+                        // outgoing task failed with an error.
+                        // drop the incoming packet processing
+                        // Notify the broker that the connection is gone, drain the receiver, and
+                        // close the connection
+
+                        drop(inc);
+
+                        debug!(message = "outgoing_task finished with an error. notifying the broker to remove the connection", %e);
+                        let msg = Message::new(client_id.clone(), Event::CloseSession);
+                        broker_handle.send(msg).await?;
+
+                        debug!("draining message receiver for connection...");
+                        while let Some(message) = recv.recv().await {
+                            trace!("dropping {:?}", message);
+                        }
+                        debug!("message receiver draining completed.");
+                    }
+                }
+
+                info!("closing connection");
+                Ok(())
+            }
+                .instrument(span)
+                .await
+        }
+        Some(Ok(packet)) => Err(ErrorKind::NoConnect(packet).into()),
+        Some(Err(e)) => Err(e.context(ErrorKind::DecodePacket).into()),
+        None => Err(ErrorKind::NoPackets.into()),
     }
-
-    println!("dropping connection");
-    Ok(())
 }
 
 async fn incoming_task<S>(
+    client_id: ClientId,
     mut incoming: S,
     mut broker: BrokerHandle,
     connection: ConnectionHandle,
@@ -56,39 +157,86 @@ async fn incoming_task<S>(
 where
     S: Stream<Item = Result<Packet, DecodeError>> + Unpin,
 {
+    debug!("incoming_task start");
     while let Some(maybe_packet) = incoming.next().await {
         match maybe_packet {
             Ok(packet) => {
-                println!("packet: {:?}", packet);
+                debug!("incoming: {:?}", packet);
                 let event = match packet {
                     Packet::Connect(connect) => Event::Connect(connect, connection.clone()),
+                    Packet::Disconnect(disconnect) => {
+                        let event = Event::Disconnect(disconnect);
+                        let message = Message::new(client_id.clone(), event);
+                        broker.send(message).await?;
+                        debug!("disconnect received. shutting down receive side of connection");
+                        return Ok(());
+                    }
+                    Packet::PingReq(ping) => Event::PingReq(ping),
                     _ => Event::Unknown,
                 };
 
-                broker.send(event).await?;
+                let message = Message::new(client_id.clone(), event);
+                broker.send(message).await?;
             }
             Err(e) => {
-                println!("error from stream: {:?}", e);
+                warn!(message="error occurred while reading from connection", error=%e);
                 return Err(e.context(ErrorKind::DecodePacket).into());
             }
         }
     }
-    println!("no more frames");
+
+    debug!("no more packets. sending DropConnection to broker.");
+    let message = Message::new(client_id.clone(), Event::DropConnection);
+    broker.send(message).await?;
+    debug!("incoming_task completing...");
     Ok(())
 }
 
-async fn outgoing_task<S>(mut events: Receiver<Event>, mut outgoing: S) -> Result<(), Error>
+async fn outgoing_task<S>(
+    mut messages: Receiver<Message>,
+    mut outgoing: S,
+) -> Result<(), (Receiver<Message>, Error)>
 where
     S: Sink<Packet, Error = EncodeError> + Unpin,
 {
-    while let Some(event) = events.recv().await {
-        match event {
-            Event::ConnAck(connack) => outgoing
-                .send(Packet::ConnAck(connack))
-                .await
-                .context(ErrorKind::EncodePacket)?,
-            _ => (),
+    debug!("outgoing_task start");
+    while let Some(message) = messages.recv().await {
+        debug!("outgoing: {:?}", message);
+        let maybe_packet = match message.into_event() {
+            Event::Connect(_, _) => None,
+            Event::ConnAck(connack) => Some(Packet::ConnAck(connack)),
+            Event::Disconnect(_) => {
+                debug!("asked to disconnect. outgoing_task completing...");
+                return Ok(());
+            }
+            Event::DropConnection => {
+                debug!("asked to drop connection. outgoing_task completing...");
+                return Ok(());
+            }
+            Event::CloseSession => None,
+            Event::PingReq(_) => None,
+            Event::PingResp(response) => Some(Packet::PingResp(response)),
+            Event::Unknown => None,
+        };
+
+        if let Some(packet) = maybe_packet {
+            let result = outgoing.send(packet).await.context(ErrorKind::EncodePacket);
+
+            if let Err(e) = result {
+                warn!(message = "error occurred while writing to connection", error=%e);
+                return Err((messages, e.into()));
+            }
         }
     }
+    debug!("outgoing_task completing...");
     Ok(())
+}
+
+fn client_id(client_id: &proto::ClientId) -> ClientId {
+    let id = match client_id {
+        proto::ClientId::ServerGenerated => Uuid::new_v4().to_string(),
+        proto::ClientId::IdWithCleanSession(ref id) => id.to_owned(),
+        proto::ClientId::IdWithExistingSession(ref id) => id.to_owned(),
+    };
+    ClientId(Arc::new(id))
 }
