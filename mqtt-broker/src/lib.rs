@@ -51,6 +51,12 @@ pub enum Event {
     /// Close session - connection is already closed but session needs clean up
     CloseSession,
 
+    // Ping request
+    PingReq(PingReq),
+
+    // Ping response
+    PingResp(PingResp),
+
     /// Unknown event
     Unknown,
 }

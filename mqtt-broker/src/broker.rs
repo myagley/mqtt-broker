@@ -74,10 +74,12 @@ impl Broker {
             Event::Connect(connect, handle) => {
                 self.handle_connect(client_id, connect, handle).await
             }
-            Event::ConnAck(_) => Ok(debug!("broker receive CONNACK, ignoring")),
+            Event::ConnAck(_) => Ok(debug!("broker received CONNACK, ignoring")),
             Event::Disconnect(_) => self.handle_disconnect(client_id).await,
             Event::DropConnection => self.handle_drop_connection(client_id).await,
             Event::CloseSession => self.handle_close_session(client_id).await,
+            Event::PingReq(ping) => self.handle_ping_req(client_id, ping).await,
+            Event::PingResp(_) => Ok(debug!("broker received PINGRESP, ignoring")),
             Event::Unknown => Ok(debug!("broker received unknown event, ignoring")),
         };
 
@@ -181,6 +183,23 @@ impl Broker {
             debug!("no session for {}", client_id);
         }
         debug!("close session handled.");
+        Ok(())
+    }
+
+    async fn handle_ping_req(
+        &mut self,
+        client_id: ClientId,
+        _ping: proto::PingReq,
+    ) -> Result<(), Error> {
+        debug!("handling ping request...");
+        if let Some(session) = self.sessions.get_mut(&client_id) {
+            session
+                .send(Message::new(client_id, Event::PingResp(proto::PingResp)))
+                .await?;
+        } else {
+            debug!("no session for {}", client_id);
+        }
+        debug!("ping request handled.");
         Ok(())
     }
 }

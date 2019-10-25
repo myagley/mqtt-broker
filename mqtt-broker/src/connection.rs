@@ -161,6 +161,7 @@ where
                         debug!("disconnect received. shutting down receive side of connection");
                         return Ok(());
                     }
+                    Packet::PingReq(ping) => Event::PingReq(ping),
                     _ => Event::Unknown,
                 };
 
