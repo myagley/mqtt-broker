@@ -5,7 +5,7 @@ use futures_util::stream::StreamExt;
 use futures_util::FutureExt;
 use tokio::net::TcpListener;
 use tokio_net::ToSocketAddrs;
-use tracing::{debug, info, span, trace, warn, Level};
+use tracing::{info, span, warn, Level};
 use tracing_futures::Instrument;
 
 use crate::broker::Broker;
