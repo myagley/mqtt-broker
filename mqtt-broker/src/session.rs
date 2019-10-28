@@ -13,7 +13,7 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn new(client_id: ClientId, handle: ConnectionHandle) -> Self {
+    fn new(client_id: ClientId, handle: ConnectionHandle) -> Self {
         Self { client_id, handle }
     }
 
@@ -57,8 +57,6 @@ impl SessionManager {
                 // same physical connection. We need to treat this as a protocol
                 // violation, move the session to offline, drop the connection, and return.
 
-                // TODO add session state for clean session
-
                 warn!("CONNECT packet received on an already established connection, dropping connection due to protocol violation");
                 Err(SessionError::ProtocolViolation(session))
             } else {
@@ -67,6 +65,8 @@ impl SessionManager {
                 //
                 // Send a DropConnection to the current handle.
                 // Update the session to use the new handle.
+
+                // TODO add session state for clean session
 
                 info!(
                     "connection request for an in use client id ({}). closing previous connection",

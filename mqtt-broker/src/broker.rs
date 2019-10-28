@@ -38,13 +38,14 @@ impl Broker {
         BrokerHandle(self.sender.clone())
     }
 
-    pub async fn run(mut self) -> Result<(), Error> {
+    pub async fn run(mut self) {
         while let Some(message) = self.messages.recv().await {
             let span = span!(Level::INFO, "broker", client_id=%message.client_id());
-            self.process_message(message).instrument(span).await?
+            if let Err(e) = self.process_message(message).instrument(span).await {
+                warn!(message = "an error occurred processing a message", error=%e);
+            }
         }
         info!("broker task exiting");
-        Ok(())
     }
 
     async fn process_message(&mut self, message: Message) -> Result<(), Error> {
@@ -126,17 +127,30 @@ impl Broker {
 
         match self.sessions.add_session(client_id.clone(), handle) {
             Ok(ack) => {
-                // TODO drop connection if response is not accepted
+                let should_drop = ack.return_code != proto::ConnectReturnCode::Accepted;
 
                 // Send ConnAck on new session
                 self.sessions.send(&client_id, Event::ConnAck(ack)).await?;
+
+                if should_drop {
+                    self.sessions
+                        .send(&client_id, Event::DropConnection)
+                        .await?;
+                }
             }
             Err(SessionError::DuplicateSession(mut session, ack)) => {
                 // Drop the old connection
                 session.send(Event::DropConnection).await?;
 
                 // Send ConnAck on new connection
+                let should_drop = ack.return_code != proto::ConnectReturnCode::Accepted;
                 self.sessions.send(&client_id, Event::ConnAck(ack)).await?;
+
+                if should_drop {
+                    self.sessions
+                        .send(&client_id, Event::DropConnection)
+                        .await?;
+                }
             }
             Err(SessionError::ProtocolViolation(mut session)) => {
                 session.send(Event::DropConnection).await?
@@ -223,7 +237,6 @@ impl BrokerHandle {
 mod tests {
     use super::*;
 
-    use futures_util::future::FutureExt;
     use matches::assert_matches;
     use uuid::Uuid;
 
@@ -231,7 +244,7 @@ mod tests {
     async fn test_double_connect_protocol_violation() {
         let broker = Broker::default();
         let mut broker_handle = broker.handle();
-        tokio::spawn(broker.run().map(drop));
+        tokio::spawn(broker.run());
 
         let connect1 = proto::Connect {
             username: None,
@@ -281,7 +294,7 @@ mod tests {
     async fn test_double_connect_drop_first() {
         let broker = Broker::default();
         let mut broker_handle = broker.handle();
-        tokio::spawn(broker.run().map(drop));
+        tokio::spawn(broker.run());
 
         let connect1 = proto::Connect {
             username: None,
@@ -333,7 +346,7 @@ mod tests {
     async fn test_invalid_protocol_name() {
         let broker = Broker::default();
         let mut broker_handle = broker.handle();
-        tokio::spawn(broker.run().map(drop));
+        tokio::spawn(broker.run());
 
         let connect1 = proto::Connect {
             username: None,
@@ -364,7 +377,7 @@ mod tests {
     async fn test_invalid_protocol_level() {
         let broker = Broker::default();
         let mut broker_handle = broker.handle();
-        tokio::spawn(broker.run().map(drop));
+        tokio::spawn(broker.run());
 
         let connect1 = proto::Connect {
             username: None,
