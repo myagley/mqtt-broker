@@ -1,11 +1,10 @@
-use std::collections::HashMap;
-
 use failure::ResultExt;
 use mqtt::proto;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tracing::{debug, info, span, warn, Level};
 use tracing_futures::Instrument;
 
+use crate::session::{SessionError, SessionManager};
 use crate::{ClientId, ConnectionHandle, Error, ErrorKind, Event, Message};
 
 static EXPECTED_PROTOCOL_NAME: &str = "MQTT";
@@ -19,33 +18,10 @@ macro_rules! try_send {
     }};
 }
 
-pub struct Session {
-    client_id: ClientId,
-    handle: ConnectionHandle,
-}
-
-impl Session {
-    pub fn new(client_id: ClientId, handle: ConnectionHandle) -> Self {
-        Self { client_id, handle }
-    }
-
-    pub fn client_id(&self) -> &ClientId {
-        &self.client_id
-    }
-
-    pub async fn send(&mut self, message: Message) -> Result<(), Error> {
-        self.handle
-            .send(message)
-            .await
-            .context(ErrorKind::SendConnectionMessage)?;
-        Ok(())
-    }
-}
-
 pub struct Broker {
     sender: Sender<Message>,
     messages: Receiver<Message>,
-    sessions: HashMap<ClientId, Session>,
+    sessions: SessionManager,
 }
 
 impl Broker {
@@ -54,7 +30,7 @@ impl Broker {
         Self {
             sender,
             messages,
-            sessions: HashMap::new(),
+            sessions: SessionManager::new(),
         }
     }
 
@@ -65,23 +41,23 @@ impl Broker {
     pub async fn run(mut self) -> Result<(), Error> {
         while let Some(message) = self.messages.recv().await {
             let span = span!(Level::INFO, "broker", client_id=%message.client_id());
-            self.handle_message(message).instrument(span).await?
+            self.process_message(message).instrument(span).await?
         }
         info!("broker task exiting");
         Ok(())
     }
 
-    async fn handle_message(&mut self, message: Message) -> Result<(), Error> {
+    async fn process_message(&mut self, message: Message) -> Result<(), Error> {
         let client_id = message.client_id().clone();
         let result = match message.into_event() {
             Event::Connect(connect, handle) => {
-                self.handle_connect(client_id, connect, handle).await
+                self.process_connect(client_id, connect, handle).await
             }
             Event::ConnAck(_) => Ok(debug!("broker received CONNACK, ignoring")),
-            Event::Disconnect(_) => self.handle_disconnect(client_id).await,
-            Event::DropConnection => self.handle_drop_connection(client_id).await,
-            Event::CloseSession => self.handle_close_session(client_id).await,
-            Event::PingReq(ping) => self.handle_ping_req(client_id, ping).await,
+            Event::Disconnect(_) => self.process_disconnect(client_id).await,
+            Event::DropConnection => self.process_drop_connection(client_id).await,
+            Event::CloseSession => self.process_close_session(client_id).await,
+            Event::PingReq(ping) => self.process_ping_req(client_id, ping).await,
             Event::PingResp(_) => Ok(debug!("broker received PINGRESP, ignoring")),
             Event::Unknown => Ok(debug!("broker received unknown event, ignoring")),
         };
@@ -93,7 +69,7 @@ impl Broker {
         Ok(())
     }
 
-    async fn handle_connect(
+    async fn process_connect(
         &mut self,
         client_id: ClientId,
         connect: proto::Connect,
@@ -148,65 +124,33 @@ impl Broker {
 
         // Process the CONNECT packet after it has been validated
 
-        let mut new_session = if let Some(mut session) = self.sessions.remove(&client_id) {
-            if session.handle == handle {
-                // [MQTT-3.1.0-2] - The Server MUST process a second CONNECT Packet
-                // sent from a Client as a protocol violation and disconnect the Client.
-                //
-                // If the handles are equal, this is a second CONNECT packet on the
-                // same physical connection. We need to treat this as a protocol
-                // violation, move the session to offline, drop the connection, and return.
+        match self.sessions.add_session(client_id.clone(), handle) {
+            Ok(ack) => {
+                // TODO drop connection if response is not accepted
 
-                // TODO add session state for clean session
-
-                warn!("CONNECT packet received on an already established connection, dropping connection due to protocol violation");
-                let message = Message::new(client_id.clone(), Event::DropConnection);
-                handle.send(message).await?;
-                return Ok(());
-            } else {
-                // [MQTT-3.1.4-2] If the ClientId represents a Client already connected to the Server
-                // then the Server MUST disconnect the existing Client.
-                //
-                // Send a DropConnection to the current handle.
-                // Update the session to use the new handle.
-
-                info!(
-                    "connection request for an in use client id ({}). closing previous connection",
-                    client_id
-                );
-                let message = Message::new(client_id.clone(), Event::DropConnection);
-                try_send!(session, message);
-
-                session.handle = handle;
-                session
+                // Send ConnAck on new session
+                self.sessions.send(&client_id, Event::ConnAck(ack)).await?;
             }
-        } else {
-            // No session present - create a new one.
-            debug!("creating new session");
-            Session::new(client_id.clone(), handle)
-        };
+            Err(SessionError::DuplicateSession(mut session, ack)) => {
+                // Drop the old connection
+                session.send(Event::DropConnection).await?;
 
-        let ack = proto::ConnAck {
-            session_present: false,
-            return_code: proto::ConnectReturnCode::Accepted,
-        };
+                // Send ConnAck on new connection
+                self.sessions.send(&client_id, Event::ConnAck(ack)).await?;
+            }
+            Err(SessionError::ProtocolViolation(mut session)) => {
+                session.send(Event::DropConnection).await?
+            }
+        }
 
-        let event = Event::ConnAck(ack);
-        let message = Message::new(client_id.clone(), event);
-        debug!("sending connack...");
-
-        try_send!(new_session, message);
-        self.sessions.insert(client_id.clone(), new_session);
         debug!("connect handled.");
-
         Ok(())
     }
 
-    async fn handle_disconnect(&mut self, client_id: ClientId) -> Result<(), Error> {
+    async fn process_disconnect(&mut self, client_id: ClientId) -> Result<(), Error> {
         debug!("handling disconnect...");
-        if let Some(mut session) = self.sessions.remove(&client_id) {
-            let message = Message::new(client_id.clone(), Event::Disconnect(proto::Disconnect));
-            session.send(message).await?;
+        if let Some(mut session) = self.sessions.remove_session(&client_id) {
+            session.send(Event::Disconnect(proto::Disconnect)).await?;
         } else {
             debug!("no session for {}", client_id);
         }
@@ -214,11 +158,10 @@ impl Broker {
         Ok(())
     }
 
-    async fn handle_drop_connection(&mut self, client_id: ClientId) -> Result<(), Error> {
+    async fn process_drop_connection(&mut self, client_id: ClientId) -> Result<(), Error> {
         debug!("handling drop connection...");
-        if let Some(mut session) = self.sessions.remove(&client_id) {
-            let message = Message::new(client_id.clone(), Event::DropConnection);
-            session.send(message).await?;
+        if let Some(mut session) = self.sessions.remove_session(&client_id) {
+            session.send(Event::DropConnection).await?;
         } else {
             debug!("no session for {}", client_id);
         }
@@ -226,9 +169,9 @@ impl Broker {
         Ok(())
     }
 
-    async fn handle_close_session(&mut self, client_id: ClientId) -> Result<(), Error> {
+    async fn process_close_session(&mut self, client_id: ClientId) -> Result<(), Error> {
         debug!("handling close session...");
-        if self.sessions.remove(&client_id).is_some() {
+        if self.sessions.remove_session(&client_id).is_some() {
             debug!("session removed");
         } else {
             debug!("no session for {}", client_id);
@@ -237,20 +180,22 @@ impl Broker {
         Ok(())
     }
 
-    async fn handle_ping_req(
+    async fn process_ping_req(
         &mut self,
         client_id: ClientId,
         _ping: proto::PingReq,
     ) -> Result<(), Error> {
         debug!("handling ping request...");
-        if let Some(session) = self.sessions.get_mut(&client_id) {
-            session
-                .send(Message::new(client_id, Event::PingResp(proto::PingResp)))
-                .await?;
-        } else {
-            debug!("no session for {}", client_id);
+
+        match self
+            .sessions
+            .send(&client_id, Event::PingResp(proto::PingResp))
+            .await
+        {
+            Ok(_) => debug!("ping response handled."),
+            Err(e) if *e.kind() == ErrorKind::NoSession => debug!("no session for {}", client_id),
+            Err(e) => return Err(e),
         }
-        debug!("ping request handled.");
         Ok(())
     }
 }

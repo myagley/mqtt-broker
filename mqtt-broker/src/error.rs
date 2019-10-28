@@ -8,7 +8,7 @@ pub struct Error {
     inner: Context<ErrorKind>,
 }
 
-#[derive(Debug, Fail)]
+#[derive(Debug, Fail, PartialEq)]
 pub enum ErrorKind {
     #[fail(display = "An error occurred trying to connect.")]
     Connect,
@@ -33,6 +33,9 @@ pub enum ErrorKind {
 
     #[fail(display = "Connection closed before any packets received.")]
     NoPackets,
+
+    #[fail(display = "No session.")]
+    NoSession,
 }
 
 impl Fail for Error {
