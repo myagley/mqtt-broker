@@ -125,7 +125,10 @@ impl Broker {
 
         // Process the CONNECT packet after it has been validated
 
-        match self.sessions.add_session(client_id.clone(), &connect, handle) {
+        match self
+            .sessions
+            .add_session(client_id.clone(), &connect, handle)
+        {
             Ok(ack) => {
                 let should_drop = ack.return_code != proto::ConnectReturnCode::Accepted;
 
@@ -163,7 +166,7 @@ impl Broker {
 
     async fn process_disconnect(&mut self, client_id: ClientId) -> Result<(), Error> {
         debug!("handling disconnect...");
-        if let Some(mut session) = self.sessions.remove_session(&client_id) {
+        if let Some(mut session) = self.sessions.close_session(&client_id) {
             session.send(Event::Disconnect(proto::Disconnect)).await?;
         } else {
             debug!("no session for {}", client_id);
@@ -174,7 +177,7 @@ impl Broker {
 
     async fn process_drop_connection(&mut self, client_id: ClientId) -> Result<(), Error> {
         debug!("handling drop connection...");
-        if let Some(mut session) = self.sessions.remove_session(&client_id) {
+        if let Some(mut session) = self.sessions.close_session(&client_id) {
             session.send(Event::DropConnection).await?;
         } else {
             debug!("no session for {}", client_id);
@@ -185,7 +188,7 @@ impl Broker {
 
     async fn process_close_session(&mut self, client_id: ClientId) -> Result<(), Error> {
         debug!("handling close session...");
-        if self.sessions.remove_session(&client_id).is_some() {
+        if self.sessions.close_session(&client_id).is_some() {
             debug!("session removed");
         } else {
             debug!("no session for {}", client_id);

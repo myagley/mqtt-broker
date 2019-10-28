@@ -36,6 +36,9 @@ pub enum ErrorKind {
 
     #[fail(display = "No session.")]
     NoSession,
+
+    #[fail(display = "Session is offline.")]
+    SessionOffline,
 }
 
 impl Fail for Error {
