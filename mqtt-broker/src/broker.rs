@@ -8,6 +8,9 @@ use tracing_futures::Instrument;
 
 use crate::{ClientId, ConnectionHandle, Error, ErrorKind, Event, Message};
 
+static EXPECTED_PROTOCOL_NAME: &str = "MQTT";
+const EXPECTED_PROTOCOL_LEVEL: u8 = 0x4;
+
 macro_rules! try_send {
     ($session:ident, $msg:expr) => {{
         if let Err(e) = $session.send($msg).await {
@@ -93,10 +96,57 @@ impl Broker {
     async fn handle_connect(
         &mut self,
         client_id: ClientId,
-        _connect: proto::Connect,
+        connect: proto::Connect,
         mut handle: ConnectionHandle,
     ) -> Result<(), Error> {
         debug!("handling connect...");
+
+        // [MQTT-3.1.2-1] - If the protocol name is incorrect the Server MAY
+        // disconnect the Client, or it MAY continue processing the CONNECT
+        // packet in accordance with some other specification.
+        // In the latter case, the Server MUST NOT continue to process the
+        // CONNECT packet in line with this specification.
+        //
+        // We will simply disconnect the client and return.
+        if &connect.protocol_name != EXPECTED_PROTOCOL_NAME {
+            warn!(
+                "invalid protocol name received from client: {}",
+                connect.protocol_name
+            );
+            debug!("dropping connection due to invalid protocol name");
+            let message = Message::new(client_id.clone(), Event::DropConnection);
+            try_send!(handle, message);
+            return Ok(());
+        }
+
+        // [MQTT-3.1.2-2] - The Server MUST respond to the CONNECT Packet
+        // with a CONNACK return code 0x01 (unacceptable protocol level)
+        // and then disconnect the Client if the Protocol Level is not supported
+        // by the Server.
+        if connect.protocol_level != EXPECTED_PROTOCOL_LEVEL {
+            warn!(
+                "invalid protocol level received from client: {}",
+                connect.protocol_level
+            );
+            let ack = proto::ConnAck {
+                session_present: false,
+                return_code: proto::ConnectReturnCode::Refused(
+                    proto::ConnectionRefusedReason::UnacceptableProtocolVersion,
+                ),
+            };
+
+            debug!("sending connack...");
+            let event = Event::ConnAck(ack);
+            let message = Message::new(client_id.clone(), event);
+            try_send!(handle, message);
+
+            debug!("dropping connection due to invalid protocol level");
+            let message = Message::new(client_id.clone(), Event::DropConnection);
+            try_send!(handle, message);
+            return Ok(());
+        }
+
+        // Process the CONNECT packet after it has been validated
 
         let mut new_session = if let Some(mut session) = self.sessions.remove(&client_id) {
             if session.handle == handle {
@@ -136,11 +186,11 @@ impl Broker {
             Session::new(client_id.clone(), handle)
         };
 
-        // TODO validate CONNECT packet
         let ack = proto::ConnAck {
             session_present: false,
             return_code: proto::ConnectReturnCode::Accepted,
         };
+
         let event = Event::ConnAck(ack);
         let message = Message::new(client_id.clone(), event);
         debug!("sending connack...");
@@ -148,6 +198,7 @@ impl Broker {
         try_send!(new_session, message);
         self.sessions.insert(client_id.clone(), new_session);
         debug!("connect handled.");
+
         Ok(())
     }
 
@@ -243,6 +294,8 @@ mod tests {
             will: None,
             client_id: proto::ClientId::IdWithCleanSession("blah".to_string()),
             keep_alive: Default::default(),
+            protocol_name: "MQTT".to_string(),
+            protocol_level: 0x4,
         };
         let connect2 = proto::Connect {
             username: None,
@@ -250,6 +303,8 @@ mod tests {
             will: None,
             client_id: proto::ClientId::IdWithCleanSession("blah".to_string()),
             keep_alive: Default::default(),
+            protocol_name: "MQTT".to_string(),
+            protocol_level: 0x4,
         };
         let id = Uuid::new_v4();
         let (tx1, mut rx1) = mpsc::channel(128);
@@ -289,6 +344,8 @@ mod tests {
             will: None,
             client_id: proto::ClientId::IdWithCleanSession("blah".to_string()),
             keep_alive: Default::default(),
+            protocol_name: "MQTT".to_string(),
+            protocol_level: 0x4,
         };
         let connect2 = proto::Connect {
             username: None,
@@ -296,6 +353,8 @@ mod tests {
             will: None,
             client_id: proto::ClientId::IdWithCleanSession("blah".to_string()),
             keep_alive: Default::default(),
+            protocol_name: "MQTT".to_string(),
+            protocol_level: 0x4,
         };
         let (tx1, mut rx1) = mpsc::channel(128);
         let (tx2, mut rx2) = mpsc::channel(128);
@@ -323,5 +382,77 @@ mod tests {
         assert!(rx1.recv().await.is_none());
 
         assert_matches!(rx2.recv().await.unwrap().event(), Event::ConnAck(_));
+    }
+
+    #[tokio::test]
+    async fn test_invalid_protocol_name() {
+        let broker = Broker::default();
+        let mut broker_handle = broker.handle();
+        tokio::spawn(broker.run().map(drop));
+
+        let connect1 = proto::Connect {
+            username: None,
+            password: None,
+            will: None,
+            client_id: proto::ClientId::IdWithCleanSession("blah".to_string()),
+            keep_alive: Default::default(),
+            protocol_name: "AMQP".to_string(),
+            protocol_level: 0x4,
+        };
+        let (tx1, mut rx1) = mpsc::channel(128);
+        let conn1 = ConnectionHandle::from_sender(tx1);
+        let client_id = ClientId::from("blah".to_string());
+
+        broker_handle
+            .send(Message::new(
+                client_id.clone(),
+                Event::Connect(connect1, conn1),
+            ))
+            .await
+            .unwrap();
+
+        assert_matches!(rx1.recv().await.unwrap().event(), Event::DropConnection);
+        assert!(rx1.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_invalid_protocol_level() {
+        let broker = Broker::default();
+        let mut broker_handle = broker.handle();
+        tokio::spawn(broker.run().map(drop));
+
+        let connect1 = proto::Connect {
+            username: None,
+            password: None,
+            will: None,
+            client_id: proto::ClientId::IdWithCleanSession("blah".to_string()),
+            keep_alive: Default::default(),
+            protocol_name: "MQTT".to_string(),
+            protocol_level: 0x3,
+        };
+        let (tx1, mut rx1) = mpsc::channel(128);
+        let conn1 = ConnectionHandle::from_sender(tx1);
+        let client_id = ClientId::from("blah".to_string());
+
+        broker_handle
+            .send(Message::new(
+                client_id.clone(),
+                Event::Connect(connect1, conn1),
+            ))
+            .await
+            .unwrap();
+
+        assert_matches!(
+            rx1.recv().await.unwrap().event(),
+            Event::ConnAck(proto::ConnAck {
+                return_code:
+                    proto::ConnectReturnCode::Refused(
+                        proto::ConnectionRefusedReason::UnacceptableProtocolVersion,
+                    ),
+                ..
+            })
+        );
+        assert_matches!(rx1.recv().await.unwrap().event(), Event::DropConnection);
+        assert!(rx1.recv().await.is_none());
     }
 }
