@@ -1,7 +1,9 @@
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use failure::ResultExt;
 use mqtt::proto;
+use tokio::clock;
 use tracing::{debug, info, warn};
 
 use crate::{ClientId, ConnectionHandle, Error, ErrorKind, Event, Message};
@@ -10,14 +12,23 @@ use crate::{ClientId, ConnectionHandle, Error, ErrorKind, Event, Message};
 pub struct Session {
     client_id: ClientId,
     handle: ConnectionHandle,
+    keep_alive: Duration,
+    last_active: Instant,
 }
 
 impl Session {
-    fn new(client_id: ClientId, handle: ConnectionHandle) -> Self {
-        Self { client_id, handle }
+    fn new(client_id: ClientId, connect: &proto::Connect, handle: ConnectionHandle) -> Self {
+        Self {
+            client_id,
+            handle,
+            keep_alive: connect.keep_alive,
+            last_active: clock::now(),
+        }
     }
 
     pub async fn send(&mut self, event: Event) -> Result<(), Error> {
+        self.last_active = clock::now();
+
         let message = Message::new(self.client_id.clone(), event);
         self.handle
             .send(message)
@@ -46,6 +57,7 @@ impl SessionManager {
     pub fn add_session(
         &mut self,
         client_id: ClientId,
+        connect: &proto::Connect,
         handle: ConnectionHandle,
     ) -> Result<proto::ConnAck, SessionError> {
         if let Some(session) = self.sessions.remove(&client_id) {
@@ -73,7 +85,7 @@ impl SessionManager {
                     client_id
                 );
 
-                let new_session = Session::new(client_id.clone(), handle);
+                let new_session = Session::new(client_id.clone(), connect, handle);
                 self.sessions.insert(client_id.clone(), new_session);
 
                 let ack = proto::ConnAck {
@@ -86,7 +98,7 @@ impl SessionManager {
         } else {
             // No session present - create a new one.
             debug!("creating new session");
-            let new_session = Session::new(client_id.clone(), handle);
+            let new_session = Session::new(client_id.clone(), connect, handle);
             self.sessions.insert(client_id.clone(), new_session);
 
             let ack = proto::ConnAck {

@@ -125,7 +125,7 @@ impl Broker {
 
         // Process the CONNECT packet after it has been validated
 
-        match self.sessions.add_session(client_id.clone(), handle) {
+        match self.sessions.add_session(client_id.clone(), &connect, handle) {
             Ok(ack) => {
                 let should_drop = ack.return_code != proto::ConnectReturnCode::Accepted;
 
