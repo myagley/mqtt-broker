@@ -346,9 +346,13 @@ mod tests {
         let client_id = ClientId::from(id.clone());
         let connect1 = transient_connect(id.clone());
         let connect2 = transient_connect(id.clone());
-        let handle = connection_handle();
-        let req1 = ConnReq::new(client_id.clone(), connect1, handle.clone());
-        let req2 = ConnReq::new(client_id.clone(), connect2, handle);
+        let id = Uuid::new_v4();
+        let (tx1, _rx1) = mpsc::channel(128);
+        let handle1 = ConnectionHandle::new(id.clone(), tx1.clone());
+        let handle2 = ConnectionHandle::new(id, tx1);
+
+        let req1 = ConnReq::new(client_id.clone(), connect1, handle1);
+        let req2 = ConnReq::new(client_id.clone(), connect2, handle2);
 
         manager.open_session(req1).unwrap();
         assert_eq!(1, manager.sessions.len());

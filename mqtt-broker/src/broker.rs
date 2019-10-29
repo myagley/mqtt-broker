@@ -265,8 +265,8 @@ mod tests {
         };
         let id = Uuid::new_v4();
         let (tx1, mut rx1) = mpsc::channel(128);
-        let conn1 = ConnectionHandle::new(id, tx1);
-        let conn2 = conn1.clone();
+        let conn1 = ConnectionHandle::new(id, tx1.clone());
+        let conn2 = ConnectionHandle::new(id, tx1);
         let client_id = ClientId::from("blah".to_string());
 
         let req1 = ConnReq::new(client_id.clone(), connect1, conn1);

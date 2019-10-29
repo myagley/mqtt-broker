@@ -39,6 +39,9 @@ pub enum ErrorKind {
 
     #[fail(display = "Session is offline.")]
     SessionOffline,
+
+    #[fail(display = "MQTT protocol violation occurred.")]
+    ProtocolViolation,
 }
 
 impl Fail for Error {
