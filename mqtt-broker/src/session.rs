@@ -32,6 +32,17 @@ impl Connected {
             persistent,
         }
     }
+
+    async fn send(&mut self, event: Event) -> Result<(), Error> {
+        self.state.last_active = clock::now();
+
+        let message = Message::new(self.state.client_id.clone(), event);
+        self.handle
+            .send(message)
+            .await
+            .context(ErrorKind::SendConnectionMessage)?;
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -74,17 +85,7 @@ impl Session {
 
     pub async fn send(&mut self, event: Event) -> Result<(), Error> {
         match self {
-            Session::Connected(ref mut connected) => {
-                connected.state.last_active = clock::now();
-
-                let message = Message::new(connected.state.client_id.clone(), event);
-                connected
-                    .handle
-                    .send(message)
-                    .await
-                    .context(ErrorKind::SendConnectionMessage)?;
-                Ok(())
-            }
+            Session::Connected(ref mut connected) => connected.send(event).await,
             Session::Disconnecting(ref client_id, ref mut handle) => {
                 let message = Message::new(client_id.clone(), event);
                 handle
