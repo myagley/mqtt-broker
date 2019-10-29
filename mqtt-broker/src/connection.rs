@@ -15,7 +15,7 @@ use tracing_futures::Instrument;
 use uuid::Uuid;
 
 use crate::broker::BrokerHandle;
-use crate::{ClientId, Error, ErrorKind, Event, Message};
+use crate::{ClientId, ConnReq, Error, ErrorKind, Event, Message};
 
 #[derive(Clone, Debug)]
 pub struct ConnectionHandle {
@@ -83,7 +83,8 @@ where
             async {
                 info!("new client connection");
 
-                let event = Event::Connect(connect, connection_handle.clone());
+                let req = ConnReq::new(client_id.clone(), connect, connection_handle.clone());
+                let event = Event::ConnReq(req);
                 let message = Message::new(client_id.clone(), event);
                 broker_handle.send(message).await?;
 
@@ -163,7 +164,9 @@ where
             Ok(packet) => {
                 debug!("incoming: {:?}", packet);
                 let event = match packet {
-                    Packet::Connect(connect) => Event::Connect(connect, connection.clone()),
+                    Packet::Connect(connect) => {
+                        Event::ConnReq(ConnReq::new(client_id.clone(), connect, connection.clone()))
+                    }
                     Packet::Disconnect(disconnect) => {
                         let event = Event::Disconnect(disconnect);
                         let message = Message::new(client_id.clone(), event);
@@ -203,7 +206,7 @@ where
     while let Some(message) = messages.recv().await {
         debug!("outgoing: {:?}", message);
         let maybe_packet = match message.into_event() {
-            Event::Connect(_, _) => None,
+            Event::ConnReq(_) => None,
             Event::ConnAck(connack) => Some(Packet::ConnAck(connack)),
             Event::Disconnect(_) => {
                 debug!("asked to disconnect. outgoing_task completing...");

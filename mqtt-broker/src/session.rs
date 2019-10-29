@@ -6,7 +6,7 @@ use mqtt::proto;
 use tokio::clock;
 use tracing::{debug, info, warn};
 
-use crate::{ClientId, ConnectionHandle, Error, ErrorKind, Event, Message};
+use crate::{ClientId, ConnReq, ConnectionHandle, Error, ErrorKind, Event, Message};
 
 #[derive(Debug)]
 pub struct State {
@@ -22,11 +22,8 @@ pub struct Connected {
 }
 
 impl Connected {
-    fn new(client_id: ClientId, connect: &proto::Connect, handle: ConnectionHandle) -> Self {
-        Self {
-            state: State::new(client_id, connect.keep_alive),
-            handle,
-        }
+    fn new(state: State, handle: ConnectionHandle) -> Self {
+        Self { state, handle }
     }
 
     async fn send(&mut self, event: Event) -> Result<(), Error> {
@@ -71,13 +68,14 @@ pub enum Session {
 }
 
 impl Session {
-    fn new_transient(state: State, handle: ConnectionHandle) -> Self {
-        let connected = Connected { state, handle };
+    fn new_transient(connreq: ConnReq) -> Self {
+        let state = State::new(connreq.client_id().clone(), connreq.connect().keep_alive);
+        let connected = Connected::new(state, connreq.into_handle());
         Session::Transient(connected)
     }
 
-    fn new_persistent(state: State, handle: ConnectionHandle) -> Self {
-        let connected = Connected { state, handle };
+    fn new_persistent(connreq: ConnReq, state: State) -> Self {
+        let connected = Connected::new(state, connreq.into_handle());
         Session::Persistent(connected)
     }
 
@@ -115,31 +113,29 @@ impl SessionManager {
         }
     }
 
-    pub fn open_session(
-        &mut self,
-        client_id: ClientId,
-        connect: &proto::Connect,
-        handle: ConnectionHandle,
-    ) -> Result<proto::ConnAck, SessionError> {
+    pub fn open_session(&mut self, connreq: ConnReq) -> Result<proto::ConnAck, SessionError> {
+        let client_id = connreq.client_id().clone();
+
         match self.sessions.remove(&client_id) {
-            Some(Session::Transient(connected)) => {
-                self.open_session_connected(client_id, connect, handle, connected)
+            Some(Session::Transient(current_connected)) => {
+                self.open_session_connected(connreq, current_connected)
             }
-            Some(Session::Persistent(connected)) => {
-                self.open_session_connected(client_id, connect, handle, connected)
+            Some(Session::Persistent(current_connected)) => {
+                self.open_session_connected(connreq, current_connected)
             }
             Some(Session::Offline(offline)) => {
                 debug!("found an offline session for {}", client_id);
 
-                let (new_session, session_present) =
-                    if let proto::ClientId::IdWithExistingSession(_) = connect.client_id {
-                        let new_session = Session::new_persistent(offline.state, handle);
-                        (new_session, true)
-                    } else {
-                        let new_session =
-                            Session::Transient(Connected::new(client_id.clone(), connect, handle));
-                        (new_session, false)
-                    };
+                let (new_session, session_present) = if let proto::ClientId::IdWithExistingSession(
+                    _,
+                ) = connreq.connect().client_id
+                {
+                    let new_session = Session::new_persistent(connreq, offline.state);
+                    (new_session, true)
+                } else {
+                    let new_session = Session::new_transient(connreq);
+                    (new_session, false)
+                };
 
                 self.sessions.insert(client_id, new_session);
 
@@ -157,13 +153,14 @@ impl SessionManager {
                 // No session present - create a new one.
                 debug!("creating new session");
 
-                let state = State::new(client_id.clone(), connect.keep_alive);
-                let new_session =
-                    if let proto::ClientId::IdWithExistingSession(_) = connect.client_id {
-                        Session::new_persistent(state, handle)
-                    } else {
-                        Session::new_transient(state, handle)
-                    };
+                let new_session = if let proto::ClientId::IdWithExistingSession(_) =
+                    connreq.connect().client_id
+                {
+                    let state = State::new(client_id.clone(), connreq.connect().keep_alive);
+                    Session::new_persistent(connreq, state)
+                } else {
+                    Session::new_transient(connreq)
+                };
 
                 self.sessions.insert(client_id.clone(), new_session);
 
@@ -179,12 +176,10 @@ impl SessionManager {
 
     fn open_session_connected(
         &mut self,
-        client_id: ClientId,
-        connect: &proto::Connect,
-        handle: ConnectionHandle,
-        connected: Connected,
+        connreq: ConnReq,
+        current_connected: Connected,
     ) -> Result<proto::ConnAck, SessionError> {
-        if connected.handle == handle {
+        if current_connected.handle == *connreq.handle() {
             // [MQTT-3.1.0-2] - The Server MUST process a second CONNECT Packet
             // sent from a Client as a protocol violation and disconnect the Client.
             //
@@ -194,8 +189,8 @@ impl SessionManager {
 
             warn!("CONNECT packet received on an already established connection, dropping connection due to protocol violation");
             Err(SessionError::ProtocolViolation(Session::Disconnecting(
-                client_id,
-                connected.handle,
+                connreq.client_id().clone(),
+                current_connected.handle,
             )))
         } else {
             // [MQTT-3.1.4-2] If the ClientId represents a Client already connected to the Server
@@ -206,18 +201,24 @@ impl SessionManager {
 
             info!(
                 "connection request for an in use client id ({}). closing previous connection",
-                client_id
+                connreq.client_id()
             );
 
+            let client_id = connreq.client_id().clone();
             let (new_session, old_session, session_present) =
-                if let proto::ClientId::IdWithExistingSession(_) = connect.client_id {
-                    let old_session = Session::Disconnecting(client_id.clone(), connected.handle);
-                    let new_session = Session::new_persistent(connected.state, handle);
+                if let proto::ClientId::IdWithExistingSession(_) = connreq.connect().client_id {
+                    let old_session = Session::Disconnecting(
+                        connreq.client_id().clone(),
+                        current_connected.handle,
+                    );
+                    let new_session = Session::new_persistent(connreq, current_connected.state);
                     (new_session, old_session, true)
                 } else {
-                    let old_session = Session::Disconnecting(client_id.clone(), connected.handle);
-                    let new_session =
-                        Session::Transient(Connected::new(client_id.clone(), connect, handle));
+                    let old_session = Session::Disconnecting(
+                        connreq.client_id().clone(),
+                        current_connected.handle,
+                    );
+                    let new_session = Session::new_transient(connreq);
                     (new_session, old_session, false)
                 };
 
@@ -303,10 +304,9 @@ mod tests {
         let client_id = ClientId::from(id.clone());
         let connect = transient_connect(id.clone());
         let handle = connection_handle();
+        let req = ConnReq::new(client_id.clone(), connect, handle);
 
-        manager
-            .open_session(client_id.clone(), &connect, handle)
-            .unwrap();
+        manager.open_session(req).unwrap();
 
         // check new session
         assert_eq!(1, manager.sessions.len());
@@ -325,10 +325,9 @@ mod tests {
         let client_id = ClientId::from(id.clone());
         let connect = persistent_connect(id.clone());
         let handle = connection_handle();
+        let req = ConnReq::new(client_id.clone(), connect, handle);
 
-        manager
-            .open_session(client_id.clone(), &connect, handle)
-            .unwrap();
+        manager.open_session(req).unwrap();
 
         assert_eq!(1, manager.sessions.len());
         assert_matches!(manager.sessions[&client_id], Session::Persistent(_));
@@ -345,15 +344,16 @@ mod tests {
         let id = "id1".to_string();
         let mut manager = SessionManager::new();
         let client_id = ClientId::from(id.clone());
-        let connect = transient_connect(id.clone());
+        let connect1 = transient_connect(id.clone());
+        let connect2 = transient_connect(id.clone());
         let handle = connection_handle();
+        let req1 = ConnReq::new(client_id.clone(), connect1, handle.clone());
+        let req2 = ConnReq::new(client_id.clone(), connect2, handle);
 
-        manager
-            .open_session(client_id.clone(), &connect, handle.clone())
-            .unwrap();
+        manager.open_session(req1).unwrap();
         assert_eq!(1, manager.sessions.len());
 
-        let result = manager.open_session(client_id.clone(), &connect, handle.clone());
+        let result = manager.open_session(req2);
         assert_matches!(result, Err(SessionError::ProtocolViolation(_)));
         assert_eq!(0, manager.sessions.len());
     }
@@ -363,16 +363,17 @@ mod tests {
         let id = "id1".to_string();
         let mut manager = SessionManager::new();
         let client_id = ClientId::from(id.clone());
-        let connect = transient_connect(id.clone());
+        let connect1 = transient_connect(id.clone());
+        let connect2 = transient_connect(id.clone());
         let handle1 = connection_handle();
         let handle2 = connection_handle();
+        let req1 = ConnReq::new(client_id.clone(), connect1, handle1);
 
-        manager
-            .open_session(client_id.clone(), &connect, handle1.clone())
-            .unwrap();
+        manager.open_session(req1).unwrap();
         assert_eq!(1, manager.sessions.len());
 
-        let result = manager.open_session(client_id.clone(), &connect, handle2.clone());
+        let req2 = ConnReq::new(client_id.clone(), connect2, handle2);
+        let result = manager.open_session(req2);
         assert_matches!(result, Err(SessionError::DuplicateSession(_, _)));
         assert_matches!(manager.sessions[&client_id], Session::Transient(_));
         assert_eq!(1, manager.sessions.len());
@@ -387,13 +388,13 @@ mod tests {
         let connect2 = persistent_connect(id.clone());
         let handle1 = connection_handle();
         let handle2 = connection_handle();
+        let req1 = ConnReq::new(client_id.clone(), connect1, handle1);
 
-        manager
-            .open_session(client_id.clone(), &connect1, handle1.clone())
-            .unwrap();
+        manager.open_session(req1).unwrap();
         assert_eq!(1, manager.sessions.len());
 
-        let result = manager.open_session(client_id.clone(), &connect2, handle2.clone());
+        let req2 = ConnReq::new(client_id.clone(), connect2, handle2);
+        let result = manager.open_session(req2);
         assert_matches!(result, Err(SessionError::DuplicateSession(_, _)));
         assert_matches!(manager.sessions[&client_id], Session::Persistent(_));
         assert_eq!(1, manager.sessions.len());
@@ -408,13 +409,13 @@ mod tests {
         let connect2 = transient_connect(id.clone());
         let handle1 = connection_handle();
         let handle2 = connection_handle();
+        let req1 = ConnReq::new(client_id.clone(), connect1, handle1);
 
-        manager
-            .open_session(client_id.clone(), &connect1, handle1.clone())
-            .unwrap();
+        manager.open_session(req1).unwrap();
         assert_eq!(1, manager.sessions.len());
 
-        let result = manager.open_session(client_id.clone(), &connect2, handle2.clone());
+        let req2 = ConnReq::new(client_id.clone(), connect2, handle2);
+        let result = manager.open_session(req2);
         assert_matches!(result, Err(SessionError::DuplicateSession(_, _)));
         assert_matches!(manager.sessions[&client_id], Session::Transient(_));
         assert_eq!(1, manager.sessions.len());
@@ -425,16 +426,17 @@ mod tests {
         let id = "id1".to_string();
         let mut manager = SessionManager::new();
         let client_id = ClientId::from(id.clone());
-        let connect = persistent_connect(id.clone());
+        let connect1 = persistent_connect(id.clone());
+        let connect2 = persistent_connect(id.clone());
         let handle1 = connection_handle();
         let handle2 = connection_handle();
+        let req1 = ConnReq::new(client_id.clone(), connect1, handle1);
+        let req2 = ConnReq::new(client_id.clone(), connect2, handle2);
 
-        manager
-            .open_session(client_id.clone(), &connect, handle1.clone())
-            .unwrap();
+        manager.open_session(req1).unwrap();
         assert_eq!(1, manager.sessions.len());
 
-        let result = manager.open_session(client_id.clone(), &connect, handle2.clone());
+        let result = manager.open_session(req2);
         assert_matches!(result, Err(SessionError::DuplicateSession(_, _)));
         assert_matches!(manager.sessions[&client_id], Session::Persistent(_));
         assert_eq!(1, manager.sessions.len());
@@ -446,12 +448,13 @@ mod tests {
         let mut manager = SessionManager::new();
         let client_id = ClientId::from(id.clone());
         let connect1 = persistent_connect(id.clone());
+        let connect2 = persistent_connect(id.clone());
         let handle1 = connection_handle();
         let handle2 = connection_handle();
+        let req1 = ConnReq::new(client_id.clone(), connect1, handle1);
+        let req2 = ConnReq::new(client_id.clone(), connect2, handle2);
 
-        manager
-            .open_session(client_id.clone(), &connect1, handle1)
-            .unwrap();
+        manager.open_session(req1).unwrap();
 
         assert_eq!(1, manager.sessions.len());
         assert_matches!(manager.sessions[&client_id], Session::Persistent(_));
@@ -463,9 +466,7 @@ mod tests {
         assert_matches!(manager.sessions[&client_id], Session::Offline(_));
 
         // Reopen session
-        manager
-            .open_session(client_id.clone(), &connect1, handle2)
-            .unwrap();
+        manager.open_session(req2).unwrap();
 
         assert_eq!(1, manager.sessions.len());
         assert_matches!(manager.sessions[&client_id], Session::Persistent(_));
@@ -479,10 +480,9 @@ mod tests {
         let connect1 = persistent_connect(id.clone());
         let handle1 = connection_handle();
         let handle2 = connection_handle();
+        let req1 = ConnReq::new(client_id.clone(), connect1, handle1);
 
-        manager
-            .open_session(client_id.clone(), &connect1, handle1)
-            .unwrap();
+        manager.open_session(req1).unwrap();
 
         assert_eq!(1, manager.sessions.len());
         assert_matches!(manager.sessions[&client_id], Session::Persistent(_));
@@ -495,9 +495,8 @@ mod tests {
 
         // Reopen session
         let connect2 = transient_connect(id.clone());
-        manager
-            .open_session(client_id.clone(), &connect2, handle2)
-            .unwrap();
+        let req2 = ConnReq::new(client_id.clone(), connect2, handle2);
+        manager.open_session(req2).unwrap();
 
         assert_eq!(1, manager.sessions.len());
         assert_matches!(manager.sessions[&client_id], Session::Transient(_));

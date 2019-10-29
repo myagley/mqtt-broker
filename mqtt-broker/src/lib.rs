@@ -1,7 +1,7 @@
 use std::fmt;
 use std::sync::Arc;
 
-use mqtt::proto::*;
+use mqtt::*;
 
 mod broker;
 mod connection;
@@ -35,15 +35,52 @@ impl From<String> for ClientId {
 }
 
 #[derive(Debug)]
+pub struct ConnReq {
+    client_id: ClientId,
+    connect: proto::Connect,
+    handle: ConnectionHandle,
+}
+
+impl ConnReq {
+    pub fn new(client_id: ClientId, connect: proto::Connect, handle: ConnectionHandle) -> Self {
+        Self {
+            client_id,
+            connect,
+            handle,
+        }
+    }
+
+    pub fn client_id(&self) -> &ClientId {
+        &self.client_id
+    }
+
+    pub fn connect(&self) -> &proto::Connect {
+        &self.connect
+    }
+
+    pub fn handle(&self) -> &ConnectionHandle {
+        &self.handle
+    }
+
+    pub fn handle_mut(&mut self) -> &mut ConnectionHandle {
+        &mut self.handle
+    }
+
+    pub fn into_handle(self) -> ConnectionHandle {
+        self.handle
+    }
+}
+
+#[derive(Debug)]
 pub enum Event {
     /// Connect request
-    Connect(Connect, ConnectionHandle),
+    ConnReq(ConnReq),
 
     /// Connect response
-    ConnAck(ConnAck),
+    ConnAck(proto::ConnAck),
 
     /// Graceful disconnect request
-    Disconnect(Disconnect),
+    Disconnect(proto::Disconnect),
 
     /// Non-graceful disconnect request,
     DropConnection,
@@ -52,10 +89,10 @@ pub enum Event {
     CloseSession,
 
     // Ping request
-    PingReq(PingReq),
+    PingReq(proto::PingReq),
 
     // Ping response
-    PingResp(PingResp),
+    PingResp(proto::PingResp),
 
     /// Unknown event
     Unknown,

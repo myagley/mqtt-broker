@@ -5,13 +5,13 @@ use tracing::{debug, info, span, warn, Level};
 use tracing_futures::Instrument;
 
 use crate::session::{SessionError, SessionManager};
-use crate::{ClientId, ConnectionHandle, Error, ErrorKind, Event, Message};
+use crate::{ClientId, ConnReq, Error, ErrorKind, Event, Message};
 
 static EXPECTED_PROTOCOL_NAME: &str = "MQTT";
 const EXPECTED_PROTOCOL_LEVEL: u8 = 0x4;
 
 macro_rules! try_send {
-    ($session:ident, $msg:expr) => {{
+    ($session:expr, $msg:expr) => {{
         if let Err(e) = $session.send($msg).await {
             warn!(message = "error processing message", %e);
         }
@@ -51,9 +51,7 @@ impl Broker {
     async fn process_message(&mut self, message: Message) -> Result<(), Error> {
         let client_id = message.client_id().clone();
         let result = match message.into_event() {
-            Event::Connect(connect, handle) => {
-                self.process_connect(client_id, connect, handle).await
-            }
+            Event::ConnReq(connreq) => self.process_connect(client_id, connreq).await,
             Event::ConnAck(_) => Ok(debug!("broker received CONNACK, ignoring")),
             Event::Disconnect(_) => self.process_disconnect(client_id).await,
             Event::DropConnection => self.process_drop_connection(client_id).await,
@@ -73,8 +71,7 @@ impl Broker {
     async fn process_connect(
         &mut self,
         client_id: ClientId,
-        connect: proto::Connect,
-        mut handle: ConnectionHandle,
+        mut connreq: ConnReq,
     ) -> Result<(), Error> {
         debug!("handling connect...");
 
@@ -85,14 +82,14 @@ impl Broker {
         // CONNECT packet in line with this specification.
         //
         // We will simply disconnect the client and return.
-        if &connect.protocol_name != EXPECTED_PROTOCOL_NAME {
+        if &connreq.connect().protocol_name != EXPECTED_PROTOCOL_NAME {
             warn!(
                 "invalid protocol name received from client: {}",
-                connect.protocol_name
+                connreq.connect().protocol_name
             );
             debug!("dropping connection due to invalid protocol name");
-            let message = Message::new(client_id.clone(), Event::DropConnection);
-            try_send!(handle, message);
+            let message = Message::new(client_id, Event::DropConnection);
+            try_send!(connreq.handle_mut(), message);
             return Ok(());
         }
 
@@ -100,10 +97,10 @@ impl Broker {
         // with a CONNACK return code 0x01 (unacceptable protocol level)
         // and then disconnect the Client if the Protocol Level is not supported
         // by the Server.
-        if connect.protocol_level != EXPECTED_PROTOCOL_LEVEL {
+        if connreq.connect().protocol_level != EXPECTED_PROTOCOL_LEVEL {
             warn!(
                 "invalid protocol level received from client: {}",
-                connect.protocol_level
+                connreq.connect().protocol_level
             );
             let ack = proto::ConnAck {
                 session_present: false,
@@ -115,20 +112,17 @@ impl Broker {
             debug!("sending connack...");
             let event = Event::ConnAck(ack);
             let message = Message::new(client_id.clone(), event);
-            try_send!(handle, message);
+            try_send!(connreq.handle_mut(), message);
 
             debug!("dropping connection due to invalid protocol level");
-            let message = Message::new(client_id.clone(), Event::DropConnection);
-            try_send!(handle, message);
+            let message = Message::new(client_id, Event::DropConnection);
+            try_send!(connreq.handle_mut(), message);
             return Ok(());
         }
 
         // Process the CONNECT packet after it has been validated
 
-        match self
-            .sessions
-            .open_session(client_id.clone(), &connect, handle)
-        {
+        match self.sessions.open_session(connreq) {
             Ok(ack) => {
                 let should_drop = ack.return_code != proto::ConnectReturnCode::Accepted;
 
@@ -243,6 +237,8 @@ mod tests {
     use matches::assert_matches;
     use uuid::Uuid;
 
+    use crate::ConnectionHandle;
+
     #[tokio::test]
     async fn test_double_connect_protocol_violation() {
         let broker = Broker::default();
@@ -273,18 +269,15 @@ mod tests {
         let conn2 = conn1.clone();
         let client_id = ClientId::from("blah".to_string());
 
+        let req1 = ConnReq::new(client_id.clone(), connect1, conn1);
+        let req2 = ConnReq::new(client_id.clone(), connect2, conn2);
+
         broker_handle
-            .send(Message::new(
-                client_id.clone(),
-                Event::Connect(connect1, conn1),
-            ))
+            .send(Message::new(client_id.clone(), Event::ConnReq(req1)))
             .await
             .unwrap();
         broker_handle
-            .send(Message::new(
-                client_id.clone(),
-                Event::Connect(connect2, conn2),
-            ))
+            .send(Message::new(client_id.clone(), Event::ConnReq(req2)))
             .await
             .unwrap();
 
@@ -323,18 +316,15 @@ mod tests {
         let conn2 = ConnectionHandle::from_sender(tx2);
         let client_id = ClientId::from("blah".to_string());
 
+        let req1 = ConnReq::new(client_id.clone(), connect1, conn1);
+        let req2 = ConnReq::new(client_id.clone(), connect2, conn2);
+
         broker_handle
-            .send(Message::new(
-                client_id.clone(),
-                Event::Connect(connect1, conn1),
-            ))
+            .send(Message::new(client_id.clone(), Event::ConnReq(req1)))
             .await
             .unwrap();
         broker_handle
-            .send(Message::new(
-                client_id.clone(),
-                Event::Connect(connect2, conn2),
-            ))
+            .send(Message::new(client_id.clone(), Event::ConnReq(req2)))
             .await
             .unwrap();
 
@@ -363,12 +353,10 @@ mod tests {
         let (tx1, mut rx1) = mpsc::channel(128);
         let conn1 = ConnectionHandle::from_sender(tx1);
         let client_id = ClientId::from("blah".to_string());
+        let req1 = ConnReq::new(client_id.clone(), connect1, conn1);
 
         broker_handle
-            .send(Message::new(
-                client_id.clone(),
-                Event::Connect(connect1, conn1),
-            ))
+            .send(Message::new(client_id.clone(), Event::ConnReq(req1)))
             .await
             .unwrap();
 
@@ -394,12 +382,10 @@ mod tests {
         let (tx1, mut rx1) = mpsc::channel(128);
         let conn1 = ConnectionHandle::from_sender(tx1);
         let client_id = ClientId::from("blah".to_string());
+        let req1 = ConnReq::new(client_id.clone(), connect1, conn1);
 
         broker_handle
-            .send(Message::new(
-                client_id.clone(),
-                Event::Connect(connect1, conn1),
-            ))
+            .send(Message::new(client_id.clone(), Event::ConnReq(req1)))
             .await
             .unwrap();
 
