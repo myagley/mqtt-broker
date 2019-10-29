@@ -148,13 +148,12 @@ impl SessionManager {
                         client_id
                     );
 
-                    let (old_session, session_present) =
+                    let (new_session, old_session, session_present) =
                         if let proto::ClientId::IdWithExistingSession(_) = connect.client_id {
                             let old_session =
                                 Session::Disconnecting(client_id.clone(), connected.handle);
                             let new_session = Session::new_connected(connected.state, handle, true);
-                            self.sessions.insert(client_id, new_session);
-                            (old_session, true)
+                            (new_session, old_session, true)
                         } else {
                             let old_session =
                                 Session::Disconnecting(client_id.clone(), connected.handle);
@@ -163,10 +162,10 @@ impl SessionManager {
                                 connect,
                                 handle,
                             ));
-                            self.sessions.insert(client_id, new_session);
-                            (old_session, false)
+                            (new_session, old_session, false)
                         };
 
+                    self.sessions.insert(client_id, new_session);
                     let ack = proto::ConnAck {
                         session_present,
                         return_code: proto::ConnectReturnCode::Accepted,
