@@ -130,9 +130,11 @@ impl SessionManager {
                     _,
                 ) = connreq.connect().client_id
                 {
+                    debug!("moving offline session to online for {}", client_id);
                     let new_session = Session::new_persistent(connreq, offline.state);
                     (new_session, true)
                 } else {
+                    info!("cleaning offline session for {}", client_id);
                     let new_session = Session::new_transient(connreq);
                     (new_session, false)
                 };
@@ -151,14 +153,15 @@ impl SessionManager {
             ),
             None => {
                 // No session present - create a new one.
-                debug!("creating new session");
 
                 let new_session = if let proto::ClientId::IdWithExistingSession(_) =
                     connreq.connect().client_id
                 {
+                    debug!("creating new persistent session for {}", client_id);
                     let state = State::new(client_id.clone(), connreq.connect().keep_alive);
                     Session::new_persistent(connreq, state)
                 } else {
+                    debug!("creating new transient session for {}", client_id);
                     Session::new_transient(connreq)
                 };
 
@@ -207,6 +210,7 @@ impl SessionManager {
             let client_id = connreq.client_id().clone();
             let (new_session, old_session, session_present) =
                 if let proto::ClientId::IdWithExistingSession(_) = connreq.connect().client_id {
+                    debug!("moving persistent session to this connection for {}", client_id);
                     let old_session = Session::Disconnecting(
                         connreq.client_id().clone(),
                         current_connected.handle,
@@ -214,6 +218,7 @@ impl SessionManager {
                     let new_session = Session::new_persistent(connreq, current_connected.state);
                     (new_session, old_session, true)
                 } else {
+                    info!("cleaning session for {}", client_id);
                     let old_session = Session::Disconnecting(
                         connreq.client_id().clone(),
                         current_connected.handle,
@@ -235,6 +240,7 @@ impl SessionManager {
     pub fn close_session(&mut self, client_id: &ClientId) -> Option<Session> {
         match self.sessions.remove(client_id) {
             Some(Session::Transient(connected)) => {
+                debug!("closing transient session for {}", client_id);
                 Some(Session::Disconnecting(client_id.clone(), connected.handle))
             }
             Some(Session::Persistent(connected)) => {
@@ -242,6 +248,7 @@ impl SessionManager {
                 // Return a disconnecting session to allow a disconnect
                 // to be sent on the connection
 
+                debug!("moving persistent session to offline for {}", client_id);
                 let new_session = Session::Offline(Offline::new(connected.state));
                 self.sessions.insert(client_id.clone(), new_session);
                 Some(Session::Disconnecting(client_id.clone(), connected.handle))
