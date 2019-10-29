@@ -98,6 +98,7 @@ impl Session {
     }
 }
 
+#[derive(Debug)]
 pub enum SessionError {
     ProtocolViolation(Session),
     DuplicateSession(Session, proto::ConnAck),
@@ -114,7 +115,7 @@ impl SessionManager {
         }
     }
 
-    pub fn add_session(
+    pub fn open_session(
         &mut self,
         client_id: ClientId,
         connect: &proto::Connect,
@@ -240,5 +241,301 @@ impl SessionManager {
             .get_mut(client_id)
             .ok_or(Error::new(ErrorKind::NoSession.into()))?;
         session.send(event).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use matches::assert_matches;
+    use tokio::sync::mpsc;
+    use uuid::Uuid;
+
+    fn connection_handle() -> ConnectionHandle {
+        let id = Uuid::new_v4();
+        let (tx1, _rx1) = mpsc::channel(128);
+        ConnectionHandle::new(id, tx1)
+    }
+
+    fn transient_connect(id: String) -> proto::Connect {
+        proto::Connect {
+            username: None,
+            password: None,
+            will: None,
+            client_id: proto::ClientId::IdWithCleanSession(id),
+            keep_alive: Default::default(),
+            protocol_name: "MQTT".to_string(),
+            protocol_level: 0x4,
+        }
+    }
+
+    fn persistent_connect(id: String) -> proto::Connect {
+        proto::Connect {
+            username: None,
+            password: None,
+            will: None,
+            client_id: proto::ClientId::IdWithExistingSession(id),
+            keep_alive: Default::default(),
+            protocol_name: "MQTT".to_string(),
+            protocol_level: 0x4,
+        }
+    }
+
+    #[test]
+    fn test_add_session_empty_transient() {
+        let id = "id1".to_string();
+        let mut manager = SessionManager::new();
+        let client_id = ClientId::from(id.clone());
+        let connect = transient_connect(id.clone());
+        let handle = connection_handle();
+
+        manager
+            .open_session(client_id.clone(), &connect, handle)
+            .unwrap();
+
+        // check new session
+        assert_eq!(1, manager.sessions.len());
+        assert_matches!(
+            manager.sessions[&client_id],
+            Session::Connected(Connected {
+                persistent: false, ..
+            })
+        );
+
+        // close session and check behavior
+        let old_session = manager.close_session(&client_id);
+        assert_matches!(old_session, Some(Session::Disconnecting(_, _)));
+        assert_eq!(0, manager.sessions.len());
+    }
+
+    #[test]
+    fn test_add_session_empty_persistent() {
+        let id = "id1".to_string();
+        let mut manager = SessionManager::new();
+        let client_id = ClientId::from(id.clone());
+        let connect = persistent_connect(id.clone());
+        let handle = connection_handle();
+
+        manager
+            .open_session(client_id.clone(), &connect, handle)
+            .unwrap();
+
+        assert_eq!(1, manager.sessions.len());
+        assert_matches!(
+            manager.sessions[&client_id],
+            Session::Connected(Connected {
+                persistent: true, ..
+            })
+        );
+
+        // close session and check behavior
+        let old_session = manager.close_session(&client_id);
+        assert_matches!(old_session, Some(Session::Disconnecting(_, _)));
+        assert_eq!(1, manager.sessions.len());
+        assert_matches!(manager.sessions[&client_id], Session::Offline(_));
+    }
+
+    #[test]
+    fn test_add_session_same_connection() {
+        let id = "id1".to_string();
+        let mut manager = SessionManager::new();
+        let client_id = ClientId::from(id.clone());
+        let connect = transient_connect(id.clone());
+        let handle = connection_handle();
+
+        manager
+            .open_session(client_id.clone(), &connect, handle.clone())
+            .unwrap();
+        assert_eq!(1, manager.sessions.len());
+
+        let result = manager.open_session(client_id.clone(), &connect, handle.clone());
+        assert_matches!(result, Err(SessionError::ProtocolViolation(_)));
+        assert_eq!(0, manager.sessions.len());
+    }
+
+    #[test]
+    fn test_add_session_different_connection_transient_then_transient() {
+        let id = "id1".to_string();
+        let mut manager = SessionManager::new();
+        let client_id = ClientId::from(id.clone());
+        let connect = transient_connect(id.clone());
+        let handle1 = connection_handle();
+        let handle2 = connection_handle();
+
+        manager
+            .open_session(client_id.clone(), &connect, handle1.clone())
+            .unwrap();
+        assert_eq!(1, manager.sessions.len());
+
+        let result = manager.open_session(client_id.clone(), &connect, handle2.clone());
+        assert_matches!(result, Err(SessionError::DuplicateSession(_, _)));
+        assert_matches!(
+            manager.sessions[&client_id],
+            Session::Connected(Connected {
+                persistent: false, ..
+            })
+        );
+        assert_eq!(1, manager.sessions.len());
+    }
+
+    #[test]
+    fn test_add_session_different_connection_transient_then_persistent() {
+        let id = "id1".to_string();
+        let mut manager = SessionManager::new();
+        let client_id = ClientId::from(id.clone());
+        let connect1 = transient_connect(id.clone());
+        let connect2 = persistent_connect(id.clone());
+        let handle1 = connection_handle();
+        let handle2 = connection_handle();
+
+        manager
+            .open_session(client_id.clone(), &connect1, handle1.clone())
+            .unwrap();
+        assert_eq!(1, manager.sessions.len());
+
+        let result = manager.open_session(client_id.clone(), &connect2, handle2.clone());
+        assert_matches!(result, Err(SessionError::DuplicateSession(_, _)));
+        assert_matches!(
+            manager.sessions[&client_id],
+            Session::Connected(Connected {
+                persistent: true, ..
+            })
+        );
+        assert_eq!(1, manager.sessions.len());
+    }
+
+    #[test]
+    fn test_add_session_different_connection_persistent_then_transient() {
+        let id = "id1".to_string();
+        let mut manager = SessionManager::new();
+        let client_id = ClientId::from(id.clone());
+        let connect1 = persistent_connect(id.clone());
+        let connect2 = transient_connect(id.clone());
+        let handle1 = connection_handle();
+        let handle2 = connection_handle();
+
+        manager
+            .open_session(client_id.clone(), &connect1, handle1.clone())
+            .unwrap();
+        assert_eq!(1, manager.sessions.len());
+
+        let result = manager.open_session(client_id.clone(), &connect2, handle2.clone());
+        assert_matches!(result, Err(SessionError::DuplicateSession(_, _)));
+        assert_matches!(
+            manager.sessions[&client_id],
+            Session::Connected(Connected {
+                persistent: false, ..
+            })
+        );
+        assert_eq!(1, manager.sessions.len());
+    }
+
+    #[test]
+    fn test_add_session_different_connection_persistent_then_persistent() {
+        let id = "id1".to_string();
+        let mut manager = SessionManager::new();
+        let client_id = ClientId::from(id.clone());
+        let connect = persistent_connect(id.clone());
+        let handle1 = connection_handle();
+        let handle2 = connection_handle();
+
+        manager
+            .open_session(client_id.clone(), &connect, handle1.clone())
+            .unwrap();
+        assert_eq!(1, manager.sessions.len());
+
+        let result = manager.open_session(client_id.clone(), &connect, handle2.clone());
+        assert_matches!(result, Err(SessionError::DuplicateSession(_, _)));
+        assert_matches!(
+            manager.sessions[&client_id],
+            Session::Connected(Connected {
+                persistent: true, ..
+            })
+        );
+        assert_eq!(1, manager.sessions.len());
+    }
+
+    #[test]
+    fn test_add_session_offline_persistent() {
+        let id = "id1".to_string();
+        let mut manager = SessionManager::new();
+        let client_id = ClientId::from(id.clone());
+        let connect1 = persistent_connect(id.clone());
+        let handle1 = connection_handle();
+        let handle2 = connection_handle();
+
+        manager
+            .open_session(client_id.clone(), &connect1, handle1)
+            .unwrap();
+
+        assert_eq!(1, manager.sessions.len());
+        assert_matches!(
+            manager.sessions[&client_id],
+            Session::Connected(Connected {
+                persistent: true, ..
+            })
+        );
+
+        // close session and check behavior
+        let old_session = manager.close_session(&client_id);
+        assert_matches!(old_session, Some(Session::Disconnecting(_, _)));
+        assert_eq!(1, manager.sessions.len());
+        assert_matches!(manager.sessions[&client_id], Session::Offline(_));
+
+        // Reopen session
+        manager
+            .open_session(client_id.clone(), &connect1, handle2)
+            .unwrap();
+
+        assert_eq!(1, manager.sessions.len());
+        assert_matches!(
+            manager.sessions[&client_id],
+            Session::Connected(Connected {
+                persistent: true, ..
+            })
+        );
+    }
+
+    #[test]
+    fn test_add_session_offline_transient() {
+        let id = "id1".to_string();
+        let mut manager = SessionManager::new();
+        let client_id = ClientId::from(id.clone());
+        let connect1 = persistent_connect(id.clone());
+        let handle1 = connection_handle();
+        let handle2 = connection_handle();
+
+        manager
+            .open_session(client_id.clone(), &connect1, handle1)
+            .unwrap();
+
+        assert_eq!(1, manager.sessions.len());
+        assert_matches!(
+            manager.sessions[&client_id],
+            Session::Connected(Connected {
+                persistent: true, ..
+            })
+        );
+
+        // close session and check behavior
+        let old_session = manager.close_session(&client_id);
+        assert_matches!(old_session, Some(Session::Disconnecting(_, _)));
+        assert_eq!(1, manager.sessions.len());
+        assert_matches!(manager.sessions[&client_id], Session::Offline(_));
+
+        // Reopen session
+        let connect2 = transient_connect(id.clone());
+        manager
+            .open_session(client_id.clone(), &connect2, handle2)
+            .unwrap();
+
+        assert_eq!(1, manager.sessions.len());
+        assert_matches!(
+            manager.sessions[&client_id],
+            Session::Connected(Connected {
+                persistent: false, ..
+            })
+        );
     }
 }

@@ -127,7 +127,7 @@ impl Broker {
 
         match self
             .sessions
-            .add_session(client_id.clone(), &connect, handle)
+            .open_session(client_id.clone(), &connect, handle)
         {
             Ok(ack) => {
                 let should_drop = ack.return_code != proto::ConnectReturnCode::Accepted;
