@@ -1,3 +1,4 @@
+use std::fmt;
 use std::str::FromStr;
 
 use crate::{Error, ErrorKind};
@@ -12,11 +13,28 @@ pub struct TopicFilter {
     segments: Vec<Segment>,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 enum Segment {
     Level(String),
     SingleLevelWildcard,
     MultiLevelWildcard,
+}
+
+impl fmt::Display for TopicFilter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let len = self.segments.len();
+        for (i, segment) in self.segments.iter().enumerate() {
+            match segment {
+                Segment::Level(ref s) => write!(f, "{}", s)?,
+                Segment::SingleLevelWildcard => write!(f, "{}", SINGLELEVEL_WILDCARD)?,
+                Segment::MultiLevelWildcard => write!(f, "{}", MULTILEVEL_WILDCARD)?,
+            }
+            if i != len - 1 {
+                write!(f, "{}", TOPIC_SEPARATOR)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 impl FromStr for TopicFilter {
@@ -72,6 +90,10 @@ impl FromStr for TopicFilter {
 mod tests {
     use super::*;
     use std::str::FromStr;
+
+    use proptest::bool;
+    use proptest::collection::vec;
+    use proptest::prelude::*;
 
     fn filter(segments: Vec<Segment>) -> TopicFilter {
         TopicFilter { segments }
@@ -142,6 +164,42 @@ mod tests {
         for case in cases.iter() {
             let result = TopicFilter::from_str(case);
             assert!(result.is_err());
+        }
+    }
+
+    fn segment_strategy() -> impl Strategy<Value = Segment> {
+        prop_oneof![
+            "[^+#\0/]+".prop_map(Segment::Level),
+            Just(Segment::SingleLevelWildcard),
+            Just(Segment::MultiLevelWildcard),
+        ]
+    }
+
+    prop_compose! {
+        pub fn arb_topic_filter()(
+            segments in vec(segment_strategy(), 1..20),
+            multi in bool::ANY,
+        ) -> TopicFilter {
+            let mut filtered = vec![];
+            for segment in segments {
+                if segment != Segment::MultiLevelWildcard {
+                    filtered.push(segment);
+                }
+            }
+
+            if multi || filtered.is_empty() {
+                filtered.push(Segment::MultiLevelWildcard);
+            }
+
+            TopicFilter { segments: filtered }
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn display_roundtrip(filter in arb_topic_filter()) {
+            let string = filter.to_string();
+            prop_assert_eq!(filter, string.parse::<TopicFilter>().unwrap());
         }
     }
 }
