@@ -354,7 +354,12 @@ impl Broker {
                 self.sessions.insert(client_id.clone(), new_session);
                 Some(Session::Disconnecting(client_id.clone(), handle))
             }
-            maybe_session => maybe_session,
+            Some(Session::Offline(offline)) => {
+                debug!("closing already offline session for {}", client_id);
+                self.sessions.insert(client_id.clone(), Session::Offline(offline));
+                None
+            }
+            _ => None,
         }
     }
 }
