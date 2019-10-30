@@ -136,9 +136,9 @@ impl Broker {
                     session.send(Event::DropConnection).await?;
                 }
             }
-            Err(SessionError::DuplicateSession(mut session, ack)) => {
+            Err(SessionError::DuplicateSession(mut old_session, ack)) => {
                 // Drop the old connection
-                session.send(Event::DropConnection).await?;
+                old_session.send(Event::DropConnection).await?;
 
                 // Send ConnAck on new connection
                 let should_drop = ack.return_code != proto::ConnectReturnCode::Accepted;
@@ -149,8 +149,8 @@ impl Broker {
                     session.send(Event::DropConnection).await?;
                 }
             }
-            Err(SessionError::ProtocolViolation(mut session)) => {
-                session.send(Event::DropConnection).await?
+            Err(SessionError::ProtocolViolation(mut old_session)) => {
+                old_session.send(Event::DropConnection).await?
             }
         }
 
@@ -475,7 +475,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_double_connect_drop_first() {
+    async fn test_double_connect_drop_first_transient() {
         let broker = Broker::default();
         let mut broker_handle = broker.handle();
         tokio::spawn(broker.run());
