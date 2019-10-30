@@ -15,9 +15,14 @@ use tracing_futures::Instrument;
 use uuid::Uuid;
 
 use crate::broker::BrokerHandle;
-use crate::{ClientId, Error, ErrorKind, Event, Message};
+use crate::{ClientId, ConnReq, Error, ErrorKind, Event, Message};
 
-#[derive(Clone, Debug)]
+/// Allows sending events to a connection.
+///
+/// It is important that this struct doesn't implement Clone,
+/// as the lifecycle management depends on there only being
+/// one sender.
+#[derive(Debug)]
 pub struct ConnectionHandle {
     id: Uuid,
     sender: Sender<Message>,
@@ -83,13 +88,14 @@ where
             async {
                 info!("new client connection");
 
-                let event = Event::Connect(connect, connection_handle.clone());
+                let req = ConnReq::new(client_id.clone(), connect, connection_handle);
+                let event = Event::ConnReq(req);
                 let message = Message::new(client_id.clone(), event);
                 broker_handle.send(message).await?;
 
                 // Start up the processing tasks
                 let incoming_task =
-                    incoming_task(client_id.clone(), incoming, broker_handle.clone(), connection_handle);
+                    incoming_task(client_id.clone(), incoming, broker_handle.clone());
                 let outgoing_task = outgoing_task(events, outgoing);
                 pin_mut!(incoming_task);
                 pin_mut!(outgoing_task);
@@ -152,7 +158,6 @@ async fn incoming_task<S>(
     client_id: ClientId,
     mut incoming: S,
     mut broker: BrokerHandle,
-    connection: ConnectionHandle,
 ) -> Result<(), Error>
 where
     S: Stream<Item = Result<Packet, DecodeError>> + Unpin,
@@ -163,7 +168,13 @@ where
             Ok(packet) => {
                 debug!("incoming: {:?}", packet);
                 let event = match packet {
-                    Packet::Connect(connect) => Event::Connect(connect, connection.clone()),
+                    Packet::Connect(_) => {
+                        // [MQTT-3.1.0-2] - The Server MUST process a second CONNECT Packet
+                        // sent from a Client as a protocol violation and disconnect the Client.
+
+                        warn!("CONNECT packet received on an already established connection, dropping connection due to protocol violation");
+                        return Err(Error::from(ErrorKind::ProtocolViolation));
+                    }
                     Packet::Disconnect(disconnect) => {
                         let event = Event::Disconnect(disconnect);
                         let message = Message::new(client_id.clone(), event);
@@ -203,7 +214,7 @@ where
     while let Some(message) = messages.recv().await {
         debug!("outgoing: {:?}", message);
         let maybe_packet = match message.into_event() {
-            Event::Connect(_, _) => None,
+            Event::ConnReq(_) => None,
             Event::ConnAck(connack) => Some(Packet::ConnAck(connack)),
             Event::Disconnect(_) => {
                 debug!("asked to disconnect. outgoing_task completing...");

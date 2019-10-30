@@ -2,7 +2,6 @@ use std::fmt::Display;
 
 use failure::ResultExt;
 use futures_util::stream::StreamExt;
-use futures_util::FutureExt;
 use tokio::net::TcpListener;
 use tokio_net::ToSocketAddrs;
 use tracing::{info, span, warn, Level};
@@ -39,7 +38,7 @@ impl Server {
 
         // TODO: handle the broker returning an error.
         // TODO: handle server graceful shutdown
-        tokio::spawn(broker.run().map(drop));
+        tokio::spawn(broker.run());
 
         while let Some(Ok(stream)) = incoming.next().await {
             let broker_handle = handle.clone();
