@@ -286,14 +286,11 @@ impl Broker {
             // sent from a Client as a protocol violation and disconnect the Client.
             //
             // If the handles are equal, this is a second CONNECT packet on the
-            // same physical connection. We need to treat this as a protocol
-            // violation, move the session to offline, drop the connection, and return.
+            // same physical connection. This condition is handled by the Connection
+            // handling code. If this state gets to the broker, something is seriously broken
+            // and we should just abort.
 
-            warn!("CONNECT packet received on an already established connection, dropping connection due to protocol violation");
-            Err(SessionError::ProtocolViolation(Session::Disconnecting(
-                connreq.client_id().clone(),
-                current_connected.into_handle(),
-            )))
+            panic!("Second CONNECT on same connection reached the broker. Connection handling logic should prevent this.");
         } else {
             // [MQTT-3.1.4-2] If the ClientId represents a Client already connected to the Server
             // then the Server MUST disconnect the existing Client.
@@ -356,7 +353,8 @@ impl Broker {
             }
             Some(Session::Offline(offline)) => {
                 debug!("closing already offline session for {}", client_id);
-                self.sessions.insert(client_id.clone(), Session::Offline(offline));
+                self.sessions
+                    .insert(client_id.clone(), Session::Offline(offline));
                 None
             }
             _ => None,
@@ -429,6 +427,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[should_panic]
     async fn test_double_connect_protocol_violation() {
         let broker = Broker::default();
         let mut broker_handle = broker.handle();
@@ -635,12 +634,37 @@ mod tests {
     }
 
     #[test]
-    fn test_add_session_same_connection() {
+    #[should_panic]
+    fn test_add_session_same_connection_transient() {
         let id = "id1".to_string();
         let mut broker = Broker::default();
         let client_id = ClientId::from(id.clone());
         let connect1 = transient_connect(id.clone());
         let connect2 = transient_connect(id.clone());
+        let id = Uuid::new_v4();
+        let (tx1, _rx1) = mpsc::channel(128);
+        let handle1 = ConnectionHandle::new(id.clone(), tx1.clone());
+        let handle2 = ConnectionHandle::new(id, tx1);
+
+        let req1 = ConnReq::new(client_id.clone(), connect1, handle1);
+        let req2 = ConnReq::new(client_id.clone(), connect2, handle2);
+
+        broker.open_session(req1).unwrap();
+        assert_eq!(1, broker.sessions.len());
+
+        let result = broker.open_session(req2);
+        assert_matches!(result, Err(SessionError::ProtocolViolation(_)));
+        assert_eq!(0, broker.sessions.len());
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_add_session_same_connection_persistent() {
+        let id = "id1".to_string();
+        let mut broker = Broker::default();
+        let client_id = ClientId::from(id.clone());
+        let connect1 = persistent_connect(id.clone());
+        let connect2 = persistent_connect(id.clone());
         let id = Uuid::new_v4();
         let (tx1, _rx1) = mpsc::channel(128);
         let handle1 = ConnectionHandle::new(id.clone(), tx1.clone());
