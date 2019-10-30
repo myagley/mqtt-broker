@@ -42,6 +42,9 @@ pub enum ErrorKind {
 
     #[fail(display = "MQTT protocol violation occurred.")]
     ProtocolViolation,
+
+    #[fail(display = "Provided topic filter is invalid: {}", _0)]
+    InvalidTopicFilter(String),
 }
 
 impl Fail for Error {
