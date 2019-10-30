@@ -1,10 +1,12 @@
+use std::collections::HashMap;
+
 use failure::ResultExt;
 use mqtt::proto;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tracing::{debug, info, span, warn, Level};
 use tracing_futures::Instrument;
 
-use crate::session::{SessionError, SessionManager};
+use crate::session::{ConnectedSession, Session, SessionState};
 use crate::{ClientId, ConnReq, Error, ErrorKind, Event, Message};
 
 static EXPECTED_PROTOCOL_NAME: &str = "MQTT";
@@ -21,7 +23,7 @@ macro_rules! try_send {
 pub struct Broker {
     sender: Sender<Message>,
     messages: Receiver<Message>,
-    sessions: SessionManager,
+    sessions: HashMap<ClientId, Session>,
 }
 
 impl Broker {
@@ -30,7 +32,7 @@ impl Broker {
         Self {
             sender,
             messages,
-            sessions: SessionManager::new(),
+            sessions: HashMap::new(),
         }
     }
 
@@ -122,17 +124,16 @@ impl Broker {
 
         // Process the CONNECT packet after it has been validated
 
-        match self.sessions.open_session(connreq) {
+        match self.open_session(connreq) {
             Ok(ack) => {
                 let should_drop = ack.return_code != proto::ConnectReturnCode::Accepted;
 
                 // Send ConnAck on new session
-                self.sessions.send(&client_id, Event::ConnAck(ack)).await?;
+                let session = self.get_session_mut(&client_id)?;
+                session.send(Event::ConnAck(ack)).await?;
 
                 if should_drop {
-                    self.sessions
-                        .send(&client_id, Event::DropConnection)
-                        .await?;
+                    session.send(Event::DropConnection).await?;
                 }
             }
             Err(SessionError::DuplicateSession(mut session, ack)) => {
@@ -141,12 +142,11 @@ impl Broker {
 
                 // Send ConnAck on new connection
                 let should_drop = ack.return_code != proto::ConnectReturnCode::Accepted;
-                self.sessions.send(&client_id, Event::ConnAck(ack)).await?;
+                let session = self.get_session_mut(&client_id)?;
+                session.send(Event::ConnAck(ack)).await?;
 
                 if should_drop {
-                    self.sessions
-                        .send(&client_id, Event::DropConnection)
-                        .await?;
+                    session.send(Event::DropConnection).await?;
                 }
             }
             Err(SessionError::ProtocolViolation(mut session)) => {
@@ -160,7 +160,7 @@ impl Broker {
 
     async fn process_disconnect(&mut self, client_id: ClientId) -> Result<(), Error> {
         debug!("handling disconnect...");
-        if let Some(mut session) = self.sessions.close_session(&client_id) {
+        if let Some(mut session) = self.close_session(&client_id) {
             session.send(Event::Disconnect(proto::Disconnect)).await?;
         } else {
             debug!("no session for {}", client_id);
@@ -171,7 +171,7 @@ impl Broker {
 
     async fn process_drop_connection(&mut self, client_id: ClientId) -> Result<(), Error> {
         debug!("handling drop connection...");
-        if let Some(mut session) = self.sessions.close_session(&client_id) {
+        if let Some(mut session) = self.close_session(&client_id) {
             session.send(Event::DropConnection).await?;
         } else {
             debug!("no session for {}", client_id);
@@ -182,7 +182,7 @@ impl Broker {
 
     async fn process_close_session(&mut self, client_id: ClientId) -> Result<(), Error> {
         debug!("handling close session...");
-        if self.sessions.close_session(&client_id).is_some() {
+        if self.close_session(&client_id).is_some() {
             debug!("session removed");
         } else {
             debug!("no session for {}", client_id);
@@ -197,17 +197,165 @@ impl Broker {
         _ping: proto::PingReq,
     ) -> Result<(), Error> {
         debug!("handling ping request...");
-
-        match self
-            .sessions
-            .send(&client_id, Event::PingResp(proto::PingResp))
-            .await
-        {
-            Ok(_) => debug!("ping response handled."),
-            Err(e) if *e.kind() == ErrorKind::NoSession => debug!("no session for {}", client_id),
-            Err(e) => return Err(e),
+        match self.get_session_mut(&client_id) {
+            Ok(session) => session.send(Event::PingResp(proto::PingResp)).await,
+            Err(e) if *e.kind() == ErrorKind::NoSession => {
+                debug!("no session for {}", client_id);
+                Ok(())
+            }
+            Err(e) => Err(e),
         }
-        Ok(())
+    }
+
+    fn get_session_mut(&mut self, client_id: &ClientId) -> Result<&mut Session, Error> {
+        self.sessions
+            .get_mut(client_id)
+            .ok_or(Error::new(ErrorKind::NoSession.into()))
+    }
+
+    fn open_session(&mut self, connreq: ConnReq) -> Result<proto::ConnAck, SessionError> {
+        let client_id = connreq.client_id().clone();
+
+        match self.sessions.remove(&client_id) {
+            Some(Session::Transient(current_connected)) => {
+                self.open_session_connected(connreq, current_connected)
+            }
+            Some(Session::Persistent(current_connected)) => {
+                self.open_session_connected(connreq, current_connected)
+            }
+            Some(Session::Offline(offline)) => {
+                debug!("found an offline session for {}", client_id);
+
+                let (new_session, session_present) = if let proto::ClientId::IdWithExistingSession(
+                    _,
+                ) = connreq.connect().client_id
+                {
+                    debug!("moving offline session to online for {}", client_id);
+                    let new_session = Session::new_persistent(connreq, offline.into_state());
+                    (new_session, true)
+                } else {
+                    info!("cleaning offline session for {}", client_id);
+                    let new_session = Session::new_transient(connreq);
+                    (new_session, false)
+                };
+
+                self.sessions.insert(client_id, new_session);
+
+                let ack = proto::ConnAck {
+                    session_present,
+                    return_code: proto::ConnectReturnCode::Accepted,
+                };
+
+                Ok(ack)
+            }
+            Some(Session::Disconnecting(client_id, handle)) => Err(
+                SessionError::ProtocolViolation(Session::Disconnecting(client_id, handle)),
+            ),
+            None => {
+                // No session present - create a new one.
+                let new_session = if let proto::ClientId::IdWithExistingSession(_) =
+                    connreq.connect().client_id
+                {
+                    debug!("creating new persistent session for {}", client_id);
+                    let state = SessionState::new(client_id.clone(), &connreq);
+                    Session::new_persistent(connreq, state)
+                } else {
+                    debug!("creating new transient session for {}", client_id);
+                    Session::new_transient(connreq)
+                };
+
+                self.sessions.insert(client_id.clone(), new_session);
+
+                let ack = proto::ConnAck {
+                    session_present: false,
+                    return_code: proto::ConnectReturnCode::Accepted,
+                };
+
+                Ok(ack)
+            }
+        }
+    }
+
+    fn open_session_connected(
+        &mut self,
+        connreq: ConnReq,
+        current_connected: ConnectedSession,
+    ) -> Result<proto::ConnAck, SessionError> {
+        if current_connected.handle() == connreq.handle() {
+            // [MQTT-3.1.0-2] - The Server MUST process a second CONNECT Packet
+            // sent from a Client as a protocol violation and disconnect the Client.
+            //
+            // If the handles are equal, this is a second CONNECT packet on the
+            // same physical connection. We need to treat this as a protocol
+            // violation, move the session to offline, drop the connection, and return.
+
+            warn!("CONNECT packet received on an already established connection, dropping connection due to protocol violation");
+            Err(SessionError::ProtocolViolation(Session::Disconnecting(
+                connreq.client_id().clone(),
+                current_connected.into_handle(),
+            )))
+        } else {
+            // [MQTT-3.1.4-2] If the ClientId represents a Client already connected to the Server
+            // then the Server MUST disconnect the existing Client.
+            //
+            // Send a DropConnection to the current handle.
+            // Update the session to use the new handle.
+
+            info!(
+                "connection request for an in use client id ({}). closing previous connection",
+                connreq.client_id()
+            );
+
+            let client_id = connreq.client_id().clone();
+            let (state, handle) = current_connected.into_parts();
+            let (new_session, old_session, session_present) =
+                if let proto::ClientId::IdWithExistingSession(_) = connreq.connect().client_id {
+                    debug!(
+                        "moving persistent session to this connection for {}",
+                        client_id
+                    );
+                    let old_session = Session::Disconnecting(connreq.client_id().clone(), handle);
+                    let new_session = Session::new_persistent(connreq, state);
+                    (new_session, old_session, true)
+                } else {
+                    info!("cleaning session for {}", client_id);
+                    let old_session = Session::Disconnecting(connreq.client_id().clone(), handle);
+                    let new_session = Session::new_transient(connreq);
+                    (new_session, old_session, false)
+                };
+
+            self.sessions.insert(client_id, new_session);
+            let ack = proto::ConnAck {
+                session_present,
+                return_code: proto::ConnectReturnCode::Accepted,
+            };
+
+            Err(SessionError::DuplicateSession(old_session, ack))
+        }
+    }
+
+    fn close_session(&mut self, client_id: &ClientId) -> Option<Session> {
+        match self.sessions.remove(client_id) {
+            Some(Session::Transient(connected)) => {
+                debug!("closing transient session for {}", client_id);
+                Some(Session::Disconnecting(
+                    client_id.clone(),
+                    connected.into_handle(),
+                ))
+            }
+            Some(Session::Persistent(connected)) => {
+                // Move a persistent session into the offline state
+                // Return a disconnecting session to allow a disconnect
+                // to be sent on the connection
+
+                debug!("moving persistent session to offline for {}", client_id);
+                let (state, handle) = connected.into_parts();
+                let new_session = Session::new_offline(state);
+                self.sessions.insert(client_id.clone(), new_session);
+                Some(Session::Disconnecting(client_id.clone(), handle))
+            }
+            maybe_session => maybe_session,
+        }
     }
 }
 
@@ -230,6 +378,12 @@ impl BrokerHandle {
     }
 }
 
+#[derive(Debug)]
+pub enum SessionError {
+    ProtocolViolation(Session),
+    DuplicateSession(Session, proto::ConnAck),
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,6 +392,36 @@ mod tests {
     use uuid::Uuid;
 
     use crate::ConnectionHandle;
+
+    fn connection_handle() -> ConnectionHandle {
+        let id = Uuid::new_v4();
+        let (tx1, _rx1) = mpsc::channel(128);
+        ConnectionHandle::new(id, tx1)
+    }
+
+    fn transient_connect(id: String) -> proto::Connect {
+        proto::Connect {
+            username: None,
+            password: None,
+            will: None,
+            client_id: proto::ClientId::IdWithCleanSession(id),
+            keep_alive: Default::default(),
+            protocol_name: "MQTT".to_string(),
+            protocol_level: 0x4,
+        }
+    }
+
+    fn persistent_connect(id: String) -> proto::Connect {
+        proto::Connect {
+            username: None,
+            password: None,
+            will: None,
+            client_id: proto::ClientId::IdWithExistingSession(id),
+            keep_alive: Default::default(),
+            protocol_name: "MQTT".to_string(),
+            protocol_level: 0x4,
+        }
+    }
 
     #[tokio::test]
     async fn test_double_connect_protocol_violation() {
@@ -401,5 +585,214 @@ mod tests {
         );
         assert_matches!(rx1.recv().await.unwrap().event(), Event::DropConnection);
         assert!(rx1.recv().await.is_none());
+    }
+
+    #[test]
+    fn test_add_session_empty_transient() {
+        let id = "id1".to_string();
+        let mut broker = Broker::default();
+        let client_id = ClientId::from(id.clone());
+        let connect = transient_connect(id.clone());
+        let handle = connection_handle();
+        let req = ConnReq::new(client_id.clone(), connect, handle);
+
+        broker.open_session(req).unwrap();
+
+        // check new session
+        assert_eq!(1, broker.sessions.len());
+        assert_matches!(broker.sessions[&client_id], Session::Transient(_));
+
+        // close session and check behavior
+        let old_session = broker.close_session(&client_id);
+        assert_matches!(old_session, Some(Session::Disconnecting(_, _)));
+        assert_eq!(0, broker.sessions.len());
+    }
+
+    #[test]
+    fn test_add_session_empty_persistent() {
+        let id = "id1".to_string();
+        let mut broker = Broker::default();
+        let client_id = ClientId::from(id.clone());
+        let connect = persistent_connect(id.clone());
+        let handle = connection_handle();
+        let req = ConnReq::new(client_id.clone(), connect, handle);
+
+        broker.open_session(req).unwrap();
+
+        assert_eq!(1, broker.sessions.len());
+        assert_matches!(broker.sessions[&client_id], Session::Persistent(_));
+
+        // close session and check behavior
+        let old_session = broker.close_session(&client_id);
+        assert_matches!(old_session, Some(Session::Disconnecting(_, _)));
+        assert_eq!(1, broker.sessions.len());
+        assert_matches!(broker.sessions[&client_id], Session::Offline(_));
+    }
+
+    #[test]
+    fn test_add_session_same_connection() {
+        let id = "id1".to_string();
+        let mut broker = Broker::default();
+        let client_id = ClientId::from(id.clone());
+        let connect1 = transient_connect(id.clone());
+        let connect2 = transient_connect(id.clone());
+        let id = Uuid::new_v4();
+        let (tx1, _rx1) = mpsc::channel(128);
+        let handle1 = ConnectionHandle::new(id.clone(), tx1.clone());
+        let handle2 = ConnectionHandle::new(id, tx1);
+
+        let req1 = ConnReq::new(client_id.clone(), connect1, handle1);
+        let req2 = ConnReq::new(client_id.clone(), connect2, handle2);
+
+        broker.open_session(req1).unwrap();
+        assert_eq!(1, broker.sessions.len());
+
+        let result = broker.open_session(req2);
+        assert_matches!(result, Err(SessionError::ProtocolViolation(_)));
+        assert_eq!(0, broker.sessions.len());
+    }
+
+    #[test]
+    fn test_add_session_different_connection_transient_then_transient() {
+        let id = "id1".to_string();
+        let mut broker = Broker::default();
+        let client_id = ClientId::from(id.clone());
+        let connect1 = transient_connect(id.clone());
+        let connect2 = transient_connect(id.clone());
+        let handle1 = connection_handle();
+        let handle2 = connection_handle();
+        let req1 = ConnReq::new(client_id.clone(), connect1, handle1);
+
+        broker.open_session(req1).unwrap();
+        assert_eq!(1, broker.sessions.len());
+
+        let req2 = ConnReq::new(client_id.clone(), connect2, handle2);
+        let result = broker.open_session(req2);
+        assert_matches!(result, Err(SessionError::DuplicateSession(_, _)));
+        assert_matches!(broker.sessions[&client_id], Session::Transient(_));
+        assert_eq!(1, broker.sessions.len());
+    }
+
+    #[test]
+    fn test_add_session_different_connection_transient_then_persistent() {
+        let id = "id1".to_string();
+        let mut broker = Broker::default();
+        let client_id = ClientId::from(id.clone());
+        let connect1 = transient_connect(id.clone());
+        let connect2 = persistent_connect(id.clone());
+        let handle1 = connection_handle();
+        let handle2 = connection_handle();
+        let req1 = ConnReq::new(client_id.clone(), connect1, handle1);
+
+        broker.open_session(req1).unwrap();
+        assert_eq!(1, broker.sessions.len());
+
+        let req2 = ConnReq::new(client_id.clone(), connect2, handle2);
+        let result = broker.open_session(req2);
+        assert_matches!(result, Err(SessionError::DuplicateSession(_, _)));
+        assert_matches!(broker.sessions[&client_id], Session::Persistent(_));
+        assert_eq!(1, broker.sessions.len());
+    }
+
+    #[test]
+    fn test_add_session_different_connection_persistent_then_transient() {
+        let id = "id1".to_string();
+        let mut broker = Broker::default();
+        let client_id = ClientId::from(id.clone());
+        let connect1 = persistent_connect(id.clone());
+        let connect2 = transient_connect(id.clone());
+        let handle1 = connection_handle();
+        let handle2 = connection_handle();
+        let req1 = ConnReq::new(client_id.clone(), connect1, handle1);
+
+        broker.open_session(req1).unwrap();
+        assert_eq!(1, broker.sessions.len());
+
+        let req2 = ConnReq::new(client_id.clone(), connect2, handle2);
+        let result = broker.open_session(req2);
+        assert_matches!(result, Err(SessionError::DuplicateSession(_, _)));
+        assert_matches!(broker.sessions[&client_id], Session::Transient(_));
+        assert_eq!(1, broker.sessions.len());
+    }
+
+    #[test]
+    fn test_add_session_different_connection_persistent_then_persistent() {
+        let id = "id1".to_string();
+        let mut broker = Broker::default();
+        let client_id = ClientId::from(id.clone());
+        let connect1 = persistent_connect(id.clone());
+        let connect2 = persistent_connect(id.clone());
+        let handle1 = connection_handle();
+        let handle2 = connection_handle();
+        let req1 = ConnReq::new(client_id.clone(), connect1, handle1);
+        let req2 = ConnReq::new(client_id.clone(), connect2, handle2);
+
+        broker.open_session(req1).unwrap();
+        assert_eq!(1, broker.sessions.len());
+
+        let result = broker.open_session(req2);
+        assert_matches!(result, Err(SessionError::DuplicateSession(_, _)));
+        assert_matches!(broker.sessions[&client_id], Session::Persistent(_));
+        assert_eq!(1, broker.sessions.len());
+    }
+
+    #[test]
+    fn test_add_session_offline_persistent() {
+        let id = "id1".to_string();
+        let mut broker = Broker::default();
+        let client_id = ClientId::from(id.clone());
+        let connect1 = persistent_connect(id.clone());
+        let connect2 = persistent_connect(id.clone());
+        let handle1 = connection_handle();
+        let handle2 = connection_handle();
+        let req1 = ConnReq::new(client_id.clone(), connect1, handle1);
+        let req2 = ConnReq::new(client_id.clone(), connect2, handle2);
+
+        broker.open_session(req1).unwrap();
+
+        assert_eq!(1, broker.sessions.len());
+        assert_matches!(broker.sessions[&client_id], Session::Persistent(_));
+
+        // close session and check behavior
+        let old_session = broker.close_session(&client_id);
+        assert_matches!(old_session, Some(Session::Disconnecting(_, _)));
+        assert_eq!(1, broker.sessions.len());
+        assert_matches!(broker.sessions[&client_id], Session::Offline(_));
+
+        // Reopen session
+        broker.open_session(req2).unwrap();
+
+        assert_eq!(1, broker.sessions.len());
+        assert_matches!(broker.sessions[&client_id], Session::Persistent(_));
+    }
+
+    #[test]
+    fn test_add_session_offline_transient() {
+        let id = "id1".to_string();
+        let mut broker = Broker::default();
+        let client_id = ClientId::from(id.clone());
+        let connect1 = persistent_connect(id.clone());
+        let handle1 = connection_handle();
+        let handle2 = connection_handle();
+        let req1 = ConnReq::new(client_id.clone(), connect1, handle1);
+
+        broker.open_session(req1).unwrap();
+
+        assert_eq!(1, broker.sessions.len());
+        assert_matches!(broker.sessions[&client_id], Session::Persistent(_));
+
+        // close session and check behavior
+        let old_session = broker.close_session(&client_id);
+        assert_matches!(old_session, Some(Session::Disconnecting(_, _)));
+        assert_eq!(1, broker.sessions.len());
+        assert_matches!(broker.sessions[&client_id], Session::Offline(_));
+
+        // Reopen session
+        let connect2 = transient_connect(id.clone());
+        let req2 = ConnReq::new(client_id.clone(), connect2, handle2);
+        broker.open_session(req2).unwrap();
+
+        assert_eq!(1, broker.sessions.len());
+        assert_matches!(broker.sessions[&client_id], Session::Transient(_));
     }
 }
