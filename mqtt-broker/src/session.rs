@@ -264,6 +264,165 @@ impl Default for PacketIdentifiers {
 mod tests {
     use super::*;
 
+    use tokio::sync::mpsc;
+    use uuid::Uuid;
+
+    use crate::ConnectionHandle;
+
+    fn connection_handle() -> ConnectionHandle {
+        let id = Uuid::new_v4();
+        let (tx1, _rx1) = mpsc::channel(128);
+        ConnectionHandle::new(id, tx1)
+    }
+
+    fn transient_connect(id: String) -> proto::Connect {
+        proto::Connect {
+            username: None,
+            password: None,
+            will: None,
+            client_id: proto::ClientId::IdWithCleanSession(id),
+            keep_alive: Default::default(),
+            protocol_name: "MQTT".to_string(),
+            protocol_level: 0x4,
+        }
+    }
+
+    #[test]
+    fn test_subscribe() {
+        let id = "id1".to_string();
+        let client_id = ClientId::from(id.clone());
+        let connect1 = transient_connect(id.clone());
+        let handle1 = connection_handle();
+        let req1 = ConnReq::new(client_id.clone(), connect1, handle1);
+        let mut session = Session::new_transient(req1);
+
+        let subscribe = proto::Subscribe {
+            packet_identifier: proto::PacketIdentifier::new(23).unwrap(),
+            subscribe_to: vec![proto::SubscribeTo {
+                topic_filter: "topic/new".to_string(),
+                qos: proto::QoS::AtMostOnce,
+            }],
+        };
+        let suback = session.subscribe(subscribe).unwrap();
+        assert_eq!(
+            proto::PacketIdentifier::new(23).unwrap(),
+            suback.packet_identifier
+        );
+        match session {
+            Session::Transient(ref connected) => {
+                assert_eq!(1, connected.state.subscriptions.len());
+                assert_eq!(
+                    proto::QoS::AtMostOnce,
+                    *connected.state.subscriptions["topic/new"].max_qos()
+                );
+            }
+            _ => panic!("not transient"),
+        }
+
+        let subscribe = proto::Subscribe {
+            packet_identifier: proto::PacketIdentifier::new(1).unwrap(),
+            subscribe_to: vec![proto::SubscribeTo {
+                topic_filter: "topic/new".to_string(),
+                qos: proto::QoS::AtLeastOnce,
+            }],
+        };
+        session.subscribe(subscribe).unwrap();
+
+        match session {
+            Session::Transient(ref connected) => {
+                assert_eq!(1, connected.state.subscriptions.len());
+                assert_eq!(
+                    proto::QoS::AtLeastOnce,
+                    *connected.state.subscriptions["topic/new"].max_qos()
+                );
+            }
+            _ => panic!("not transient"),
+        }
+    }
+
+    #[test]
+    fn test_unsubscribe() {
+        let id = "id1".to_string();
+        let client_id = ClientId::from(id.clone());
+        let connect1 = transient_connect(id.clone());
+        let handle1 = connection_handle();
+        let req1 = ConnReq::new(client_id.clone(), connect1, handle1);
+        let mut session = Session::new_transient(req1);
+
+        let subscribe = proto::Subscribe {
+            packet_identifier: proto::PacketIdentifier::new(1).unwrap(),
+            subscribe_to: vec![proto::SubscribeTo {
+                topic_filter: "topic/new".to_string(),
+                qos: proto::QoS::AtMostOnce,
+            }],
+        };
+        session.subscribe(subscribe).unwrap();
+        match session {
+            Session::Transient(ref connected) => {
+                assert_eq!(1, connected.state.subscriptions.len());
+                assert_eq!(
+                    proto::QoS::AtMostOnce,
+                    *connected.state.subscriptions["topic/new"].max_qos()
+                );
+            }
+            _ => panic!("not transient"),
+        }
+
+        let unsubscribe = proto::Unsubscribe {
+            packet_identifier: proto::PacketIdentifier::new(1).unwrap(),
+            unsubscribe_from: vec!["topic/different".to_string()],
+        };
+        session.unsubscribe(unsubscribe).unwrap();
+
+        match session {
+            Session::Transient(ref connected) => {
+                assert_eq!(1, connected.state.subscriptions.len());
+                assert_eq!(
+                    proto::QoS::AtMostOnce,
+                    *connected.state.subscriptions["topic/new"].max_qos()
+                );
+            }
+            _ => panic!("not transient"),
+        }
+
+        let unsubscribe = proto::Unsubscribe {
+            packet_identifier: proto::PacketIdentifier::new(24).unwrap(),
+            unsubscribe_from: vec!["topic/new".to_string()],
+        };
+        let unsuback = session.unsubscribe(unsubscribe).unwrap();
+        assert_eq!(
+            proto::PacketIdentifier::new(24).unwrap(),
+            unsuback.packet_identifier
+        );
+
+        match session {
+            Session::Transient(ref connected) => {
+                assert_eq!(0, connected.state.subscriptions.len());
+            }
+            _ => panic!("not transient"),
+        }
+    }
+
+    #[test]
+    fn test_offline_subscribe() {
+        let id = "id1".to_string();
+        let client_id = ClientId::from(id.clone());
+        let connect1 = transient_connect(id.clone());
+        let handle1 = connection_handle();
+        let req1 = ConnReq::new(client_id.clone(), connect1, handle1);
+        let mut session = Session::new_offline(SessionState::new(client_id, &req1));
+
+        let subscribe = proto::Subscribe {
+            packet_identifier: proto::PacketIdentifier::new(1).unwrap(),
+            subscribe_to: vec![proto::SubscribeTo {
+                topic_filter: "topic/new".to_string(),
+                qos: proto::QoS::AtMostOnce,
+            }],
+        };
+        let err = session.subscribe(subscribe).unwrap_err();
+        assert_eq!(ErrorKind::SessionOffline, *err.kind());
+    }
+
     #[test]
     fn packet_identifiers() {
         #[cfg(target_pointer_width = "32")]

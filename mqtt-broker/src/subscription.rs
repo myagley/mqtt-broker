@@ -51,7 +51,7 @@ impl TopicFilter {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 enum Segment {
     Level(String),
     SingleLevelWildcard,
