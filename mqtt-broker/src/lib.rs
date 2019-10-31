@@ -8,6 +8,7 @@ mod connection;
 mod error;
 mod server;
 mod session;
+mod topic;
 
 pub use crate::connection::ConnectionHandle;
 pub use crate::error::{Error, ErrorKind};
