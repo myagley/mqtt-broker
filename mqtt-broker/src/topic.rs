@@ -11,6 +11,22 @@ static SINGLELEVEL_WILDCARD: &str = "+";
 #[derive(Debug, PartialEq)]
 pub struct TopicFilter {
     segments: Vec<Segment>,
+    multilevel: bool,
+}
+
+impl TopicFilter {
+    fn new(segments: Vec<Segment>) -> Self {
+        let len = segments.len();
+        let multilevel = len > 0 && segments[len - 1] == Segment::MultiLevelWildcard;
+        Self {
+            segments,
+            multilevel,
+        }
+    }
+
+    pub fn matches(&self, _topic_name: &str) -> bool {
+        true
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -18,6 +34,16 @@ enum Segment {
     Level(String),
     SingleLevelWildcard,
     MultiLevelWildcard,
+}
+
+impl Segment {
+    pub fn matches(&self, segment: &str) -> bool {
+        match self {
+            Segment::Level(ref s) => s == segment,
+            Segment::SingleLevelWildcard => true,
+            Segment::MultiLevelWildcard => true,
+        }
+    }
 }
 
 impl fmt::Display for TopicFilter {
@@ -80,8 +106,7 @@ impl FromStr for TopicFilter {
                 )));
             }
         }
-
-        let filter = TopicFilter { segments };
+        let filter = TopicFilter::new(segments);
         Ok(filter)
     }
 }
@@ -96,7 +121,7 @@ mod tests {
     use proptest::prelude::*;
 
     fn filter(segments: Vec<Segment>) -> TopicFilter {
-        TopicFilter { segments }
+        TopicFilter::new(segments)
     }
 
     #[test]
@@ -191,7 +216,7 @@ mod tests {
                 filtered.push(Segment::MultiLevelWildcard);
             }
 
-            TopicFilter { segments: filtered }
+            TopicFilter::new(filtered)
         }
     }
 
