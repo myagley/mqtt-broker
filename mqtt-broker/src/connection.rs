@@ -213,6 +213,7 @@ where
                     }
                     Packet::PingReq(ping) => Event::PingReq(ping),
                     Packet::Subscribe(subscribe) => Event::Subscribe(subscribe),
+                    Packet::Unsubscribe(unsubscribe) => Event::Unsubscribe(unsubscribe),
                     _ => Event::Unknown,
                 };
 
@@ -259,6 +260,8 @@ where
             Event::PingResp(response) => Some(Packet::PingResp(response)),
             Event::Subscribe(_) => None,
             Event::SubAck(suback) => Some(Packet::SubAck(suback)),
+            Event::Unsubscribe(_) => None,
+            Event::UnsubAck(unsuback) => Some(Packet::UnsubAck(unsuback)),
             Event::Unknown => None,
         };
 

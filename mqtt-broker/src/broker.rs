@@ -62,6 +62,10 @@ impl Broker {
             Event::PingResp(_) => Ok(info!("broker received PINGRESP, ignoring")),
             Event::Subscribe(subscribe) => self.process_subscribe(client_id, subscribe).await,
             Event::SubAck(_) => Ok(info!("broker received SUBACK, ignoring")),
+            Event::Unsubscribe(unsubscribe) => {
+                self.process_unsubscribe(client_id, unsubscribe).await
+            }
+            Event::UnsubAck(_) => Ok(info!("broker received UNSUBACK, ignoring")),
             Event::Unknown => Ok(info!("broker received unknown event, ignoring")),
         };
 
@@ -219,6 +223,24 @@ impl Broker {
                 // TODO handle retained messages
                 let suback = session.subscribe(subscribe)?;
                 session.send(Event::SubAck(suback)).await
+            }
+            Err(e) if *e.kind() == ErrorKind::NoSession => {
+                debug!("no session for {}", client_id);
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn process_unsubscribe(
+        &mut self,
+        client_id: ClientId,
+        unsubscribe: proto::Unsubscribe,
+    ) -> Result<(), Error> {
+        match self.get_session_mut(&client_id) {
+            Ok(session) => {
+                let unsuback = session.unsubscribe(unsubscribe)?;
+                session.send(Event::UnsubAck(unsuback)).await
             }
             Err(e) if *e.kind() == ErrorKind::NoSession => {
                 debug!("no session for {}", client_id);

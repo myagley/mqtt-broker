@@ -61,6 +61,20 @@ impl ConnectedSession {
         Ok(suback)
     }
 
+    pub fn unsubscribe(
+        &mut self,
+        unsubscribe: proto::Unsubscribe,
+    ) -> Result<proto::UnsubAck, Error> {
+        for filter in unsubscribe.unsubscribe_from.iter() {
+            self.state.remove_subscription(&filter);
+        }
+
+        let unsuback = proto::UnsubAck {
+            packet_identifier: unsubscribe.packet_identifier,
+        };
+        Ok(unsuback)
+    }
+
     async fn send(&mut self, event: Event) -> Result<(), Error> {
         self.state.last_active = clock::now();
 
@@ -113,6 +127,10 @@ impl SessionState {
     ) -> Option<Subscription> {
         self.subscriptions.insert(topic_filter, subscription)
     }
+
+    pub fn remove_subscription(&mut self, topic_filter: &str) -> Option<Subscription> {
+        self.subscriptions.remove(topic_filter)
+    }
 }
 
 #[derive(Debug)]
@@ -144,6 +162,18 @@ impl Session {
         match self {
             Session::Transient(connected) => connected.subscribe(subscribe),
             Session::Persistent(connected) => connected.subscribe(subscribe),
+            Session::Offline(_) => Err(Error::from(ErrorKind::SessionOffline)),
+            Session::Disconnecting(_, _) => Err(Error::from(ErrorKind::SessionOffline)),
+        }
+    }
+
+    pub fn unsubscribe(
+        &mut self,
+        unsubscribe: proto::Unsubscribe,
+    ) -> Result<proto::UnsubAck, Error> {
+        match self {
+            Session::Transient(connected) => connected.unsubscribe(unsubscribe),
+            Session::Persistent(connected) => connected.unsubscribe(unsubscribe),
             Session::Offline(_) => Err(Error::from(ErrorKind::SessionOffline)),
             Session::Disconnecting(_, _) => Err(Error::from(ErrorKind::SessionOffline)),
         }

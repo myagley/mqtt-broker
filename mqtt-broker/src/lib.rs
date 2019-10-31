@@ -89,17 +89,23 @@ pub enum Event {
     /// Close session - connection is already closed but session needs clean up
     CloseSession,
 
-    // Ping request
+    /// Ping request
     PingReq(proto::PingReq),
 
-    // Ping response
+    /// Ping response
     PingResp(proto::PingResp),
 
-    // Subscribe
+    /// Subscribe
     Subscribe(proto::Subscribe),
 
-    // SubAck
+    /// SubAck
     SubAck(proto::SubAck),
+
+    /// Unsubscribe
+    Unsubscribe(proto::Unsubscribe),
+
+    /// UnsubAck
+    UnsubAck(proto::UnsubAck),
 
     /// Unknown event
     Unknown,
