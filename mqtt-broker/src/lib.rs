@@ -8,7 +8,7 @@ mod connection;
 mod error;
 mod server;
 mod session;
-mod topic;
+mod subscription;
 
 pub use crate::connection::ConnectionHandle;
 pub use crate::error::{Error, ErrorKind};
@@ -94,6 +94,12 @@ pub enum Event {
 
     // Ping response
     PingResp(proto::PingResp),
+
+    // Subscribe
+    Subscribe(proto::Subscribe),
+
+    // SubAck
+    SubAck(proto::SubAck),
 
     /// Unknown event
     Unknown,

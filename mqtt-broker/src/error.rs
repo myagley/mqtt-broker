@@ -47,7 +47,7 @@ pub enum ErrorKind {
     InvalidTopicFilter(String),
 
     #[fail(display = "All packet identifiers are exhausted.")]
-    PacketIdentifiersExhausted
+    PacketIdentifiersExhausted,
 }
 
 impl Fail for Error {

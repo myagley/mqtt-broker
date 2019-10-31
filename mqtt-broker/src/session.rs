@@ -1,10 +1,13 @@
-use std::{fmt, mem};
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
+use std::{fmt, mem};
 
 use failure::ResultExt;
 use mqtt::proto;
 use tokio::clock;
+use tracing::warn;
 
+use crate::subscription::{Subscription, TopicFilter};
 use crate::{ClientId, ConnReq, ConnectionHandle, Error, ErrorKind, Event, Message};
 
 #[derive(Debug)]
@@ -28,6 +31,30 @@ impl ConnectedSession {
 
     pub fn into_parts(self) -> (SessionState, ConnectionHandle) {
         (self.state, self.handle)
+    }
+
+    pub fn subscribe(&mut self, subscribe: proto::Subscribe) -> Result<proto::SubAck, Error> {
+        let mut acks = Vec::with_capacity(subscribe.subscribe_to.len());
+        for subscribe_to in subscribe.subscribe_to.iter() {
+            let ack_qos = match subscribe_to.topic_filter.parse() {
+                Ok(filter) => {
+                    let subscription = Subscription::new(filter, subscribe_to.qos);
+                    self.state.update_subscription(subscription);
+                    proto::SubAckQos::Success(subscribe_to.qos)
+                }
+                Err(e) => {
+                    warn!("invalid topic filter {}: {}", subscribe_to.topic_filter, e);
+                    proto::SubAckQos::Failure
+                }
+            };
+            acks.push(ack_qos);
+        }
+
+        let suback = proto::SubAck {
+            packet_identifier: subscribe.packet_identifier,
+            qos: acks,
+        };
+        Ok(suback)
     }
 
     async fn send(&mut self, event: Event) -> Result<(), Error> {
@@ -62,6 +89,7 @@ pub struct SessionState {
     client_id: ClientId,
     keep_alive: Duration,
     last_active: Instant,
+    subscriptions: HashMap<TopicFilter, Subscription>,
 }
 
 impl SessionState {
@@ -70,7 +98,13 @@ impl SessionState {
             client_id,
             keep_alive: connreq.connect().keep_alive,
             last_active: clock::now(),
+            subscriptions: HashMap::new(),
         }
+    }
+
+    pub fn update_subscription(&mut self, subscription: Subscription) -> Option<Subscription> {
+        self.subscriptions
+            .insert(subscription.filter().clone(), subscription)
     }
 }
 
@@ -97,6 +131,15 @@ impl Session {
     pub fn new_offline(state: SessionState) -> Self {
         let offline = OfflineSession::new(state);
         Session::Offline(offline)
+    }
+
+    pub fn subscribe(&mut self, subscribe: proto::Subscribe) -> Result<proto::SubAck, Error> {
+        match self {
+            Session::Transient(connected) => connected.subscribe(subscribe),
+            Session::Persistent(connected) => connected.subscribe(subscribe),
+            Session::Offline(_) => Err(Error::from(ErrorKind::SessionOffline)),
+            Session::Disconnecting(_, _) => Err(Error::from(ErrorKind::SessionOffline)),
+        }
     }
 
     pub async fn send(&mut self, event: Event) -> Result<(), Error> {

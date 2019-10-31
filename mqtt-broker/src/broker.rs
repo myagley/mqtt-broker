@@ -54,13 +54,15 @@ impl Broker {
         let client_id = message.client_id().clone();
         let result = match message.into_event() {
             Event::ConnReq(connreq) => self.process_connect(client_id, connreq).await,
-            Event::ConnAck(_) => Ok(debug!("broker received CONNACK, ignoring")),
+            Event::ConnAck(_) => Ok(info!("broker received CONNACK, ignoring")),
             Event::Disconnect(_) => self.process_disconnect(client_id).await,
             Event::DropConnection => self.process_drop_connection(client_id).await,
             Event::CloseSession => self.process_close_session(client_id).await,
             Event::PingReq(ping) => self.process_ping_req(client_id, ping).await,
-            Event::PingResp(_) => Ok(debug!("broker received PINGRESP, ignoring")),
-            Event::Unknown => Ok(debug!("broker received unknown event, ignoring")),
+            Event::PingResp(_) => Ok(info!("broker received PINGRESP, ignoring")),
+            Event::Subscribe(subscribe) => self.process_subscribe(client_id, subscribe).await,
+            Event::SubAck(_) => Ok(info!("broker received SUBACK, ignoring")),
+            Event::Unknown => Ok(info!("broker received unknown event, ignoring")),
         };
 
         if let Err(e) = result {
@@ -199,6 +201,24 @@ impl Broker {
         debug!("handling ping request...");
         match self.get_session_mut(&client_id) {
             Ok(session) => session.send(Event::PingResp(proto::PingResp)).await,
+            Err(e) if *e.kind() == ErrorKind::NoSession => {
+                debug!("no session for {}", client_id);
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn process_subscribe(
+        &mut self,
+        client_id: ClientId,
+        subscribe: proto::Subscribe,
+    ) -> Result<(), Error> {
+        match self.get_session_mut(&client_id) {
+            Ok(session) => {
+                let suback = session.subscribe(subscribe)?;
+                session.send(Event::SubAck(suback)).await
+            }
             Err(e) if *e.kind() == ErrorKind::NoSession => {
                 debug!("no session for {}", client_id);
                 Ok(())
