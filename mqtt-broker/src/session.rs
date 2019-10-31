@@ -7,7 +7,7 @@ use mqtt::proto;
 use tokio::clock;
 use tracing::warn;
 
-use crate::subscription::{Subscription, TopicFilter};
+use crate::subscription::Subscription;
 use crate::{ClientId, ConnReq, ConnectionHandle, Error, ErrorKind, Event, Message};
 
 #[derive(Debug)]
@@ -35,12 +35,16 @@ impl ConnectedSession {
 
     pub fn subscribe(&mut self, subscribe: proto::Subscribe) -> Result<proto::SubAck, Error> {
         let mut acks = Vec::with_capacity(subscribe.subscribe_to.len());
-        for subscribe_to in subscribe.subscribe_to.iter() {
+        let packet_identifier = subscribe.packet_identifier;
+
+        for subscribe_to in subscribe.subscribe_to.into_iter() {
             let ack_qos = match subscribe_to.topic_filter.parse() {
                 Ok(filter) => {
-                    let subscription = Subscription::new(filter, subscribe_to.qos);
-                    self.state.update_subscription(subscription);
-                    proto::SubAckQos::Success(subscribe_to.qos)
+                    let proto::SubscribeTo { topic_filter, qos } = subscribe_to;
+
+                    let subscription = Subscription::new(filter, qos);
+                    self.state.update_subscription(topic_filter, subscription);
+                    proto::SubAckQos::Success(qos)
                 }
                 Err(e) => {
                     warn!("invalid topic filter {}: {}", subscribe_to.topic_filter, e);
@@ -51,7 +55,7 @@ impl ConnectedSession {
         }
 
         let suback = proto::SubAck {
-            packet_identifier: subscribe.packet_identifier,
+            packet_identifier,
             qos: acks,
         };
         Ok(suback)
@@ -89,7 +93,7 @@ pub struct SessionState {
     client_id: ClientId,
     keep_alive: Duration,
     last_active: Instant,
-    subscriptions: HashMap<TopicFilter, Subscription>,
+    subscriptions: HashMap<String, Subscription>,
 }
 
 impl SessionState {
@@ -102,9 +106,12 @@ impl SessionState {
         }
     }
 
-    pub fn update_subscription(&mut self, subscription: Subscription) -> Option<Subscription> {
-        self.subscriptions
-            .insert(subscription.filter().clone(), subscription)
+    pub fn update_subscription(
+        &mut self,
+        topic_filter: String,
+        subscription: Subscription,
+    ) -> Option<Subscription> {
+        self.subscriptions.insert(topic_filter, subscription)
     }
 }
 

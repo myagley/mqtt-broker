@@ -216,6 +216,7 @@ impl Broker {
     ) -> Result<(), Error> {
         match self.get_session_mut(&client_id) {
             Ok(session) => {
+                // TODO handle retained messages
                 let suback = session.subscribe(subscribe)?;
                 session.send(Event::SubAck(suback)).await
             }

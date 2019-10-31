@@ -30,7 +30,7 @@ impl Subscription {
     }
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub struct TopicFilter {
     segments: Vec<Segment>,
     multilevel: bool,
@@ -51,7 +51,7 @@ impl TopicFilter {
     }
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Debug, PartialEq)]
 enum Segment {
     Level(String),
     SingleLevelWildcard,
