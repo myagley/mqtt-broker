@@ -1,21 +1,30 @@
 use std::fmt;
 use std::sync::Arc;
+use std::time::Duration;
 
 use failure::{Fail, ResultExt};
 use futures_util::future::{select, Either};
 use futures_util::pin_mut;
 use futures_util::sink::{Sink, SinkExt};
 use futures_util::stream::{Stream, StreamExt};
+use lazy_static::lazy_static;
 use mqtt::proto::{self, DecodeError, EncodeError, Packet, PacketCodec};
 use tokio::codec::Framed;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc::{self, Receiver, Sender};
+use tokio_io_timeout::TimeoutStream;
 use tracing::{debug, info, span, trace, warn, Level};
 use tracing_futures::Instrument;
 use uuid::Uuid;
 
 use crate::broker::BrokerHandle;
 use crate::{ClientId, ConnReq, Error, ErrorKind, Event, Message};
+
+lazy_static! {
+    static ref DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
+}
+
+const KEEPALIVE_MULT: f32 = 1.5;
 
 /// Allows sending events to a connection.
 ///
@@ -66,8 +75,11 @@ pub async fn process<I>(io: I, mut broker_handle: BrokerHandle) -> Result<(), Er
 where
     I: AsyncRead + AsyncWrite + Unpin,
 {
-    let codec = Framed::new(io, PacketCodec::default());
-    let (outgoing, mut incoming) = codec.split();
+    let mut timeout = TimeoutStream::new(io);
+    timeout.set_read_timeout(Some(*DEFAULT_TIMEOUT));
+    timeout.set_write_timeout(Some(*DEFAULT_TIMEOUT));
+
+    let mut codec = Framed::new(timeout, PacketCodec::default());
 
     // [MQTT-3.1.0-1] - After a Network Connection is established by a Client to a Server,
     // the first Packet sent from the Client to the Server MUST be a CONNECT Packet.
@@ -77,7 +89,7 @@ where
     // The broker state machine will also have to handle not receiving a connect packet first
     // to keep the state machine correct.
 
-    match incoming.next().await {
+    match codec.next().await {
         Some(Ok(Packet::Connect(connect))) => {
             let client_id = client_id(&connect.client_id);
             let (sender, events) = mpsc::channel(128);
@@ -87,6 +99,22 @@ where
             // async block to attach instrumentation context
             async {
                 info!("new client connection");
+
+                // [MQTT-3.1.2-24] - If the Keep Alive value is non-zero and
+                // the Server does not receive a Control Packet from the
+                // Client within one and a half times the Keep Alive time
+                // period, it MUST disconnect the Network Connection to the
+                // Client as if the network had failed.
+                let keep_alive = connect.keep_alive.mul_f32(KEEPALIVE_MULT);
+                if keep_alive == Duration::from_secs(0) {
+                    debug!("received 0 length keepalive from client. disabling keepalive timeout");
+                    codec.get_mut().set_read_timeout(None);
+                } else {
+                    debug!("using keepalive timeout of {:?}", keep_alive);
+                    codec.get_mut().set_read_timeout(Some(keep_alive));
+                }
+
+                let (outgoing, incoming) = codec.split();
 
                 let req = ConnReq::new(client_id.clone(), connect, connection_handle);
                 let event = Event::ConnReq(req);
