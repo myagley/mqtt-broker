@@ -285,7 +285,7 @@ where
             Event::Unsubscribe(unsub) => Some(Packet::Unsubscribe(unsub)),
             Event::UnsubAck(unsuback) => Some(Packet::UnsubAck(unsuback)),
             Event::PublishFrom(_publish) => None,
-            Event::PublishTo(Publish::QoS12(publish)) => Some(Packet::Publish(publish)),
+            Event::PublishTo(Publish::QoS12(_id, publish)) => Some(Packet::Publish(publish)),
             Event::PublishTo(Publish::QoS0(id, publish)) => {
                 let result = outgoing
                     .send(Packet::Publish(publish))

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::{Duration, Instant};
 use std::{cmp, fmt, mem};
 
@@ -9,6 +9,8 @@ use tracing::{debug, warn};
 
 use crate::subscription::Subscription;
 use crate::{ClientId, ConnReq, ConnectionHandle, Error, ErrorKind, Event, Message, Publish};
+
+const MAX_INFLIGHT_MESSAGES: usize = 16;
 
 #[derive(Debug)]
 pub struct ConnectedSession {
@@ -41,11 +43,17 @@ impl ConnectedSession {
     }
 
     pub async fn puback0(&mut self, id: proto::PacketIdentifier) -> Result<(), Error> {
-        Ok(self.state.puback0(id))
+        if let Some(event) = self.state.puback0(id)? {
+            self.send(event).await?;
+        }
+        Ok(())
     }
 
     pub async fn puback(&mut self, puback: &proto::PubAck) -> Result<(), Error> {
-        Ok(self.state.puback(puback))
+        if let Some(event) = self.state.puback(puback)? {
+            self.send(event).await?;
+        }
+        Ok(())
     }
 
     pub fn subscribe(&mut self, subscribe: proto::Subscribe) -> Result<proto::SubAck, Error> {
@@ -113,12 +121,7 @@ impl OfflineSession {
     }
 
     pub fn publish(&mut self, publication: proto::Publication) -> Result<(), Error> {
-        self.state.publish(publication)?;
-        Ok(())
-    }
-
-    pub fn puback0(&mut self, id: proto::PacketIdentifier) -> Result<(), Error> {
-        Ok(self.state.puback0(id))
+        self.state.queue_publish(publication)
     }
 
     pub fn into_state(self) -> SessionState {
@@ -134,6 +137,10 @@ pub struct SessionState {
     subscriptions: HashMap<String, Subscription>,
     packet_identifiers: PacketIdentifiers,
     packet_identifiers_qos0: PacketIdentifiers,
+
+    waiting_to_be_sent: VecDeque<proto::Publication>,
+    waiting_to_be_acked: BTreeMap<proto::PacketIdentifier, Publish>,
+    waiting_to_be_acked_qos0: BTreeMap<proto::PacketIdentifier, Publish>,
 }
 
 impl SessionState {
@@ -145,6 +152,10 @@ impl SessionState {
             subscriptions: HashMap::new(),
             packet_identifiers: PacketIdentifiers::default(),
             packet_identifiers_qos0: PacketIdentifiers::default(),
+
+            waiting_to_be_sent: VecDeque::new(),
+            waiting_to_be_acked: BTreeMap::new(),
+            waiting_to_be_acked_qos0: BTreeMap::new(),
         }
     }
 
@@ -160,9 +171,59 @@ impl SessionState {
         self.subscriptions.remove(topic_filter)
     }
 
+    pub fn queue_publish(&mut self, publication: proto::Publication) -> Result<(), Error> {
+        if let Some(publication) = self.filter(publication) {
+            self.waiting_to_be_sent.push_back(publication);
+        }
+        Ok(())
+    }
+
     /// Takes a publication and returns an optional Publish packet if sending is allowed.
     /// This can return None if the current outstanding messages is at its limit.
     pub fn publish(&mut self, publication: proto::Publication) -> Result<Option<Event>, Error> {
+        if let Some(publication) = self.filter(publication) {
+            if self.allowed_to_send() {
+                let event = self.prepare_to_send(publication)?;
+                Ok(Some(event))
+            } else {
+                self.waiting_to_be_sent.push_back(publication);
+                Ok(None)
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn puback(&mut self, puback: &proto::PubAck) -> Result<Option<Event>, Error> {
+        debug!("discarding packet identifier {}", puback.packet_identifier);
+        self.waiting_to_be_acked.remove(&puback.packet_identifier);
+        self.packet_identifiers.discard(puback.packet_identifier);
+        self.try_publish()
+    }
+
+    pub fn puback0(&mut self, id: proto::PacketIdentifier) -> Result<Option<Event>, Error> {
+        debug!("discarding QoS 0 packet identifier {}", id);
+        self.waiting_to_be_acked_qos0.remove(&id);
+        self.packet_identifiers_qos0.discard(id);
+        self.try_publish()
+    }
+
+    fn try_publish(&mut self) -> Result<Option<Event>, Error> {
+        if self.allowed_to_send() {
+            if let Some(publication) = self.waiting_to_be_sent.pop_front() {
+                let event = self.prepare_to_send(publication)?;
+                return Ok(Some(event));
+            }
+        }
+        Ok(None)
+    }
+
+    fn allowed_to_send(&self) -> bool {
+        let num_inflight = self.waiting_to_be_acked.len() + self.waiting_to_be_acked_qos0.len();
+        num_inflight < MAX_INFLIGHT_MESSAGES
+    }
+
+    fn filter(&self, mut publication: proto::Publication) -> Option<proto::Publication> {
         self.subscriptions
             .values()
             .filter(|sub| sub.filter().matches(&publication.topic_name))
@@ -171,55 +232,62 @@ impl SessionState {
                     .or_else(|| Some(cmp::min(*sub.max_qos(), publication.qos)))
             })
             .map(move |qos| {
-                let publish = match qos {
-                    proto::QoS::AtMostOnce => {
-                        let id = self.packet_identifiers_qos0.reserve()?;
-                        let packet = proto::Publish {
-                            packet_identifier_dup_qos: proto::PacketIdentifierDupQoS::AtMostOnce,
-                            retain: false,
-                            topic_name: publication.topic_name.to_owned(),
-                            payload: publication.payload.to_owned(),
-                        };
-                        Publish::QoS0(id, packet)
-                    }
-                    proto::QoS::AtLeastOnce => {
-                        let id = self.packet_identifiers.reserve()?;
-                        let packet = proto::Publish {
-                            packet_identifier_dup_qos: proto::PacketIdentifierDupQoS::AtLeastOnce(
-                                id, false,
-                            ),
-                            retain: false,
-                            topic_name: publication.topic_name.to_owned(),
-                            payload: publication.payload.to_owned(),
-                        };
-                        Publish::QoS12(packet)
-                    }
-                    proto::QoS::ExactlyOnce => {
-                        let id = self.packet_identifiers.reserve()?;
-                        let packet = proto::Publish {
-                            packet_identifier_dup_qos: proto::PacketIdentifierDupQoS::ExactlyOnce(
-                                id, false,
-                            ),
-                            retain: false,
-                            topic_name: publication.topic_name.to_owned(),
-                            payload: publication.payload.to_owned(),
-                        };
-                        Publish::QoS12(packet)
-                    }
-                };
-                Ok(Event::PublishTo(publish))
+                publication.qos = qos;
+                publication
             })
-            .transpose()
     }
 
-    pub fn puback(&mut self, puback: &proto::PubAck) {
-        debug!("discarding packet identifier {}", puback.packet_identifier);
-        self.packet_identifiers.discard(puback.packet_identifier)
-    }
+    fn prepare_to_send(&mut self, publication: proto::Publication) -> Result<Event, Error> {
+        let publish = match publication.qos {
+            proto::QoS::AtMostOnce => {
+                let id = self.packet_identifiers_qos0.reserve()?;
+                let packet = proto::Publish {
+                    packet_identifier_dup_qos: proto::PacketIdentifierDupQoS::AtMostOnce,
+                    retain: false,
+                    topic_name: publication.topic_name.to_owned(),
+                    payload: publication.payload.to_owned(),
+                };
+                Publish::QoS0(id, packet)
+            }
+            proto::QoS::AtLeastOnce => {
+                let id = self.packet_identifiers.reserve()?;
+                let packet = proto::Publish {
+                    packet_identifier_dup_qos: proto::PacketIdentifierDupQoS::AtLeastOnce(
+                        id, false,
+                    ),
+                    retain: false,
+                    topic_name: publication.topic_name.to_owned(),
+                    payload: publication.payload.to_owned(),
+                };
+                Publish::QoS12(id, packet)
+            }
+            proto::QoS::ExactlyOnce => {
+                let id = self.packet_identifiers.reserve()?;
+                let packet = proto::Publish {
+                    packet_identifier_dup_qos: proto::PacketIdentifierDupQoS::ExactlyOnce(
+                        id, false,
+                    ),
+                    retain: false,
+                    topic_name: publication.topic_name.to_owned(),
+                    payload: publication.payload.to_owned(),
+                };
+                Publish::QoS12(id, packet)
+            }
+        };
 
-    pub fn puback0(&mut self, id: proto::PacketIdentifier) {
-        debug!("discarding QoS 0 packet identifier {}", id);
-        self.packet_identifiers_qos0.discard(id)
+        let event = match publish {
+            Publish::QoS0(id, publish) => {
+                self.waiting_to_be_acked_qos0
+                    .insert(id, Publish::QoS0(id, publish.clone()));
+                Event::PublishTo(Publish::QoS0(id, publish))
+            }
+            Publish::QoS12(id, publish) => {
+                self.waiting_to_be_acked
+                    .insert(id, Publish::QoS12(id, publish.clone()));
+                Event::PublishTo(Publish::QoS12(id, publish))
+            }
+        };
+        Ok(event)
     }
 }
 
@@ -270,7 +338,7 @@ impl Session {
         match self {
             Session::Transient(connected) => connected.puback0(id).await,
             Session::Persistent(connected) => connected.puback0(id).await,
-            Session::Offline(offline) => offline.puback0(id),
+            Session::Offline(_offline) => Err(Error::from(ErrorKind::SessionOffline)),
             Session::Disconnecting(_, _) => Err(Error::from(ErrorKind::SessionOffline)),
         }
     }
