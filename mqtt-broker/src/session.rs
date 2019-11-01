@@ -424,6 +424,23 @@ mod tests {
     }
 
     #[test]
+    fn test_offline_unsubscribe() {
+        let id = "id1".to_string();
+        let client_id = ClientId::from(id.clone());
+        let connect1 = transient_connect(id.clone());
+        let handle1 = connection_handle();
+        let req1 = ConnReq::new(client_id.clone(), connect1, handle1);
+        let mut session = Session::new_offline(SessionState::new(client_id, &req1));
+
+        let unsubscribe = proto::Unsubscribe {
+            packet_identifier: proto::PacketIdentifier::new(24).unwrap(),
+            unsubscribe_from: vec!["topic/new".to_string()],
+        };
+        let err = session.unsubscribe(unsubscribe).unwrap_err();
+        assert_eq!(ErrorKind::SessionOffline, *err.kind());
+    }
+
+    #[test]
     fn packet_identifiers() {
         #[cfg(target_pointer_width = "32")]
         assert_eq!(PacketIdentifiers::SIZE, 2048);
