@@ -99,6 +99,7 @@ where
             // async block to attach instrumentation context
             async {
                 info!("new client connection");
+                debug!("received CONNECT: {:?}", connect);
 
                 // [MQTT-3.1.2-24] - If the Keep Alive value is non-zero and
                 // the Server does not receive a Control Packet from the
@@ -211,6 +212,8 @@ where
                         return Ok(());
                     }
                     Packet::PingReq(ping) => Event::PingReq(ping),
+                    Packet::Subscribe(subscribe) => Event::Subscribe(subscribe),
+                    Packet::Unsubscribe(unsubscribe) => Event::Unsubscribe(unsubscribe),
                     _ => Event::Unknown,
                 };
 
@@ -255,6 +258,10 @@ where
             Event::CloseSession => None,
             Event::PingReq(_) => None,
             Event::PingResp(response) => Some(Packet::PingResp(response)),
+            Event::Subscribe(_) => None,
+            Event::SubAck(suback) => Some(Packet::SubAck(suback)),
+            Event::Unsubscribe(_) => None,
+            Event::UnsubAck(unsuback) => Some(Packet::UnsubAck(unsuback)),
             Event::Unknown => None,
         };
 

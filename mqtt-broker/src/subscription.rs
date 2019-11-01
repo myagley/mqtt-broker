@@ -1,12 +1,34 @@
 use std::fmt;
 use std::str::FromStr;
 
+use mqtt::proto;
+
 use crate::{Error, ErrorKind};
 
 const NUL_CHAR: char = '\0';
 const TOPIC_SEPARATOR: char = '/';
 static MULTILEVEL_WILDCARD: &str = "#";
 static SINGLELEVEL_WILDCARD: &str = "+";
+
+#[derive(Debug, PartialEq)]
+pub struct Subscription {
+    filter: TopicFilter,
+    max_qos: proto::QoS,
+}
+
+impl Subscription {
+    pub fn new(filter: TopicFilter, max_qos: proto::QoS) -> Self {
+        Self { filter, max_qos }
+    }
+
+    pub fn filter(&self) -> &TopicFilter {
+        &self.filter
+    }
+
+    pub fn max_qos(&self) -> &proto::QoS {
+        &self.max_qos
+    }
+}
 
 #[derive(Debug, PartialEq)]
 pub struct TopicFilter {

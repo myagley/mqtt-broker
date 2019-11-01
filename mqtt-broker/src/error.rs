@@ -45,6 +45,9 @@ pub enum ErrorKind {
 
     #[fail(display = "Provided topic filter is invalid: {}", _0)]
     InvalidTopicFilter(String),
+
+    #[fail(display = "All packet identifiers are exhausted.")]
+    PacketIdentifiersExhausted,
 }
 
 impl Fail for Error {

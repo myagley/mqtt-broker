@@ -8,7 +8,7 @@ mod connection;
 mod error;
 mod server;
 mod session;
-mod topic;
+mod subscription;
 
 pub use crate::connection::ConnectionHandle;
 pub use crate::error::{Error, ErrorKind};
@@ -89,11 +89,23 @@ pub enum Event {
     /// Close session - connection is already closed but session needs clean up
     CloseSession,
 
-    // Ping request
+    /// Ping request
     PingReq(proto::PingReq),
 
-    // Ping response
+    /// Ping response
     PingResp(proto::PingResp),
+
+    /// Subscribe
+    Subscribe(proto::Subscribe),
+
+    /// SubAck
+    SubAck(proto::SubAck),
+
+    /// Unsubscribe
+    Unsubscribe(proto::Unsubscribe),
+
+    /// UnsubAck
+    UnsubAck(proto::UnsubAck),
 
     /// Unknown event
     Unknown,
