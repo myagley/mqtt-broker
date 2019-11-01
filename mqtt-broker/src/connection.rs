@@ -18,7 +18,7 @@ use tracing_futures::Instrument;
 use uuid::Uuid;
 
 use crate::broker::BrokerHandle;
-use crate::{ClientId, ConnReq, Error, ErrorKind, Event, Message};
+use crate::{ClientId, ConnReq, Error, ErrorKind, Event, Message, Publish};
 
 lazy_static! {
     static ref DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -125,7 +125,7 @@ where
                 // Start up the processing tasks
                 let incoming_task =
                     incoming_task(client_id.clone(), incoming, broker_handle.clone());
-                let outgoing_task = outgoing_task(events, outgoing);
+                let outgoing_task = outgoing_task(client_id.clone(), events, outgoing, broker_handle.clone());
                 pin_mut!(incoming_task);
                 pin_mut!(outgoing_task);
 
@@ -208,7 +208,6 @@ where
     while let Some(maybe_packet) = incoming.next().await {
         match maybe_packet {
             Ok(packet) => {
-                debug!("incoming: {:?}", packet);
                 let event = match packet {
                     Packet::Connect(_) => {
                         // [MQTT-3.1.0-2] - The Server MUST process a second CONNECT Packet
@@ -229,7 +228,7 @@ where
                     Packet::PingResp(pingresp) => Event::PingResp(pingresp),
                     Packet::PubAck(puback) => Event::PubAck(puback),
                     Packet::PubComp(pubcomp) => Event::PubComp(pubcomp),
-                    Packet::Publish(publish) => Event::Publish(publish),
+                    Packet::Publish(publish) => Event::PublishFrom(publish),
                     Packet::PubRec(pubrec) => Event::PubRec(pubrec),
                     Packet::PubRel(pubrel) => Event::PubRel(pubrel),
                     Packet::Subscribe(subscribe) => Event::Subscribe(subscribe),
@@ -256,8 +255,10 @@ where
 }
 
 async fn outgoing_task<S>(
+    client_id: ClientId,
     mut messages: Receiver<Message>,
     mut outgoing: S,
+    mut broker: BrokerHandle,
 ) -> Result<(), (Receiver<Message>, Error)>
 where
     S: Sink<Packet, Error = EncodeError> + Unpin,
@@ -283,7 +284,27 @@ where
             Event::SubAck(suback) => Some(Packet::SubAck(suback)),
             Event::Unsubscribe(unsub) => Some(Packet::Unsubscribe(unsub)),
             Event::UnsubAck(unsuback) => Some(Packet::UnsubAck(unsuback)),
-            Event::Publish(publish) => Some(Packet::Publish(publish)),
+            Event::PublishFrom(_publish) => None,
+            Event::PublishTo(Publish::QoS12(publish)) => Some(Packet::Publish(publish)),
+            Event::PublishTo(Publish::QoS0(id, publish)) => {
+                let result = outgoing
+                    .send(Packet::Publish(publish))
+                    .await
+                    .context(ErrorKind::EncodePacket);
+
+                if let Err(e) = result {
+                    warn!(message = "error occurred while writing to connection", error=%e);
+                    return Err((messages, e.into()));
+                } else {
+                    let message = Message::new(client_id.clone(), Event::PubAck0(id));
+                    if let Err(e) = broker.send(message).await {
+                        warn!(message = "error occurred while sending QoS ack to broker", error=%e);
+                        return Err((messages, e.into()));
+                    }
+                }
+                None
+            }
+            Event::PubAck0(_id) => None,
             Event::PubAck(puback) => Some(Packet::PubAck(puback)),
             Event::PubRec(pubrec) => Some(Packet::PubRec(pubrec)),
             Event::PubRel(pubrel) => Some(Packet::PubRel(pubrel)),

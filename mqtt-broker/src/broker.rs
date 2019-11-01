@@ -54,6 +54,7 @@ impl Broker {
 
     async fn process_message(&mut self, message: Message) -> Result<(), Error> {
         let (client_id, event) = message.into_parts();
+        debug!("incoming: {:?}", event);
         let result = match event {
             Event::ConnReq(connreq) => self.process_connect(client_id, connreq).await,
             Event::ConnAck(_) => Ok(info!("broker received CONNACK, ignoring")),
@@ -68,7 +69,9 @@ impl Broker {
                 self.process_unsubscribe(client_id, unsubscribe).await
             }
             Event::UnsubAck(_) => Ok(info!("broker received UNSUBACK, ignoring")),
-            Event::Publish(publish) => self.process_publish(client_id, publish).await,
+            Event::PublishFrom(publish) => self.process_publish(client_id, publish).await,
+            Event::PublishTo(_publish) => Ok(info!("broker received a PublishTo, ignoring")),
+            Event::PubAck0(id) => self.process_puback0(client_id, id).await,
             Event::PubAck(puback) => self.process_puback(client_id, puback).await,
             Event::PubRec(pubrec) => self.process_pubrec(client_id, pubrec).await,
             Event::PubRel(pubrel) => self.process_pubrel(client_id, pubrel).await,
@@ -309,6 +312,21 @@ impl Broker {
                 }
             })
             .await
+    }
+
+    async fn process_puback0(
+        &mut self,
+        client_id: ClientId,
+        id: proto::PacketIdentifier,
+    ) -> Result<(), Error> {
+        match self.get_session_mut(&client_id) {
+            Ok(session) => session.puback0(id).await,
+            Err(e) if *e.kind() == ErrorKind::NoSession => {
+                debug!("no session for {}", client_id);
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     async fn process_puback(

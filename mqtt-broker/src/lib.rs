@@ -73,6 +73,12 @@ impl ConnReq {
 }
 
 #[derive(Debug)]
+pub enum Publish {
+    QoS0(proto::PacketIdentifier, proto::Publish),
+    QoS12(proto::Publish),
+}
+
+#[derive(Debug)]
 pub enum Event {
     /// Connect request
     ConnReq(ConnReq),
@@ -107,8 +113,14 @@ pub enum Event {
     /// UnsubAck
     UnsubAck(proto::UnsubAck),
 
-    /// Publish
-    Publish(proto::Publish),
+    /// PublishFrom - publish packet from a client
+    PublishFrom(proto::Publish),
+
+    /// PublishTo - publish packet to a client
+    PublishTo(Publish),
+
+    /// Publish acknowledgement (QoS 0)
+    PubAck0(proto::PacketIdentifier),
 
     /// Publish acknowledgement (QoS 1)
     PubAck(proto::PubAck),
