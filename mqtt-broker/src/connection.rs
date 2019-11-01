@@ -132,7 +132,14 @@ where
                 match select(incoming_task, outgoing_task).await {
                     Either::Left((Ok(()), out)) => {
                         debug!("incoming_task finished with ok. waiting for outgoing_task to complete...");
-                        out.await.map_err(|(_, e)| e)?;
+
+                        if let Err((mut recv, e)) = out.await {
+                            debug!(message = "outgoing_task finished with an error. draining message receiver for connection...", %e);
+                            while let Some(message) = recv.recv().await {
+                                trace!("dropping {:?}", message);
+                            }
+                            debug!("message receiver draining completed.");
+                        }
                         debug!("outgoing_task completed.");
                     }
                     Either::Left((Err(e), out)) => {
@@ -144,7 +151,13 @@ where
                         broker_handle.send(msg).await?;
 
                         debug!("waiting for outgoing_task to complete...");
-                        out.await.map_err(|(_, e)| e)?;
+                        if let Err((mut recv, e)) = out.await {
+                            debug!(message = "outgoing_task finished with an error. draining message receiver for connection...", %e);
+                            while let Some(message) = recv.recv().await {
+                                trace!("dropping {:?}", message);
+                            }
+                            debug!("message receiver draining completed.");
+                        }
                         debug!("outgoing_task completed.");
                     }
                     Either::Right((Ok(()), inc)) => {

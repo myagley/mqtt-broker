@@ -1,11 +1,11 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
-use std::{fmt, mem};
+use std::{cmp, fmt, mem};
 
 use failure::ResultExt;
 use mqtt::proto;
 use tokio::clock;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::subscription::Subscription;
 use crate::{ClientId, ConnReq, ConnectionHandle, Error, ErrorKind, Event, Message};
@@ -31,6 +31,17 @@ impl ConnectedSession {
 
     pub fn into_parts(self) -> (SessionState, ConnectionHandle) {
         (self.state, self.handle)
+    }
+
+    pub async fn publish(&mut self, publication: proto::Publication) -> Result<(), Error> {
+        if let Some(publish) = self.state.publish(publication)? {
+            self.send(Event::Publish(publish)).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn puback(&mut self, puback: &proto::PubAck) -> Result<(), Error> {
+        Ok(self.state.puback(puback))
     }
 
     pub fn subscribe(&mut self, subscribe: proto::Subscribe) -> Result<proto::SubAck, Error> {
@@ -97,6 +108,11 @@ impl OfflineSession {
         Self { state }
     }
 
+    pub fn publish(&mut self, publication: proto::Publication) -> Result<(), Error> {
+        self.state.publish(publication)?;
+        Ok(())
+    }
+
     pub fn into_state(self) -> SessionState {
         self.state
     }
@@ -108,6 +124,7 @@ pub struct SessionState {
     keep_alive: Duration,
     last_active: Instant,
     subscriptions: HashMap<String, Subscription>,
+    packet_identifiers: PacketIdentifiers,
 }
 
 impl SessionState {
@@ -117,6 +134,7 @@ impl SessionState {
             keep_alive: connreq.connect().keep_alive,
             last_active: clock::now(),
             subscriptions: HashMap::new(),
+            packet_identifiers: PacketIdentifiers::default(),
         }
     }
 
@@ -130,6 +148,47 @@ impl SessionState {
 
     pub fn remove_subscription(&mut self, topic_filter: &str) -> Option<Subscription> {
         self.subscriptions.remove(topic_filter)
+    }
+
+    /// Takes a publication and returns an optional Publish packet if sending is allowed.
+    /// This can return None if the current outstanding messages is at its limit.
+    pub fn publish(
+        &mut self,
+        publication: proto::Publication,
+    ) -> Result<Option<proto::Publish>, Error> {
+        self.subscriptions
+            .values()
+            .filter(|sub| sub.filter().matches(&publication.topic_name))
+            .fold(None, |acc, sub| {
+                acc.map(|qos| cmp::max(qos, cmp::min(*sub.max_qos(), publication.qos)))
+                    .or_else(|| Some(cmp::min(*sub.max_qos(), publication.qos)))
+            })
+            .map(move |qos| {
+                let pidq = match qos {
+                    proto::QoS::AtMostOnce => proto::PacketIdentifierDupQoS::AtMostOnce,
+                    proto::QoS::AtLeastOnce => proto::PacketIdentifierDupQoS::AtLeastOnce(
+                        self.packet_identifiers.reserve()?,
+                        false,
+                    ),
+                    proto::QoS::ExactlyOnce => proto::PacketIdentifierDupQoS::AtLeastOnce(
+                        self.packet_identifiers.reserve()?,
+                        false,
+                    ),
+                };
+                let publish = proto::Publish {
+                    packet_identifier_dup_qos: pidq,
+                    retain: false,
+                    topic_name: publication.topic_name.to_owned(),
+                    payload: publication.payload.to_owned(),
+                };
+                Ok(publish)
+            })
+            .transpose()
+    }
+
+    pub fn puback(&mut self, puback: &proto::PubAck) {
+        debug!("discarding packet identifier {}", puback.packet_identifier);
+        self.packet_identifiers.discard(puback.packet_identifier)
     }
 }
 
@@ -156,6 +215,24 @@ impl Session {
     pub fn new_offline(state: SessionState) -> Self {
         let offline = OfflineSession::new(state);
         Session::Offline(offline)
+    }
+
+    pub async fn publish(&mut self, publication: &proto::Publication) -> Result<(), Error> {
+        match self {
+            Session::Transient(connected) => connected.publish(publication.to_owned()).await,
+            Session::Persistent(connected) => connected.publish(publication.to_owned()).await,
+            Session::Offline(offline) => offline.publish(publication.to_owned()),
+            Session::Disconnecting(_, _) => Err(Error::from(ErrorKind::SessionOffline)),
+        }
+    }
+
+    pub async fn puback(&mut self, puback: &proto::PubAck) -> Result<(), Error> {
+        match self {
+            Session::Transient(connected) => connected.puback(puback).await,
+            Session::Persistent(connected) => connected.puback(puback).await,
+            Session::Offline(_offline) => Err(Error::from(ErrorKind::SessionOffline)),
+            Session::Disconnecting(_, _) => Err(Error::from(ErrorKind::SessionOffline)),
+        }
     }
 
     pub fn subscribe(&mut self, subscribe: proto::Subscribe) -> Result<proto::SubAck, Error> {

@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 
 use failure::ResultExt;
+use futures_util::stream::futures_unordered::FuturesUnordered;
+use futures_util::stream::StreamExt;
 use mqtt::proto;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tracing::{debug, info, span, warn, Level};
@@ -256,18 +258,72 @@ impl Broker {
 
     async fn process_publish(
         &mut self,
-        _client_id: ClientId,
-        _publish: proto::Publish,
+        client_id: ClientId,
+        publish: proto::Publish,
     ) -> Result<(), Error> {
-        Ok(())
+        let publication = match self.get_session_mut(&client_id) {
+            Ok(session) => {
+                let proto::Publish {
+                    packet_identifier_dup_qos: pidq,
+                    retain,
+                    topic_name,
+                    payload,
+                } = publish;
+                let qos = match pidq {
+                    proto::PacketIdentifierDupQoS::AtMostOnce => proto::QoS::AtMostOnce,
+                    proto::PacketIdentifierDupQoS::AtLeastOnce(packet_identifier, _dup) => {
+                        let puback = proto::PubAck { packet_identifier };
+                        session.send(Event::PubAck(puback)).await?;
+                        proto::QoS::AtLeastOnce
+                    }
+                    proto::PacketIdentifierDupQoS::ExactlyOnce(packet_identifier, _dup) => {
+                        let pubrec = proto::PubRec { packet_identifier };
+                        session.send(Event::PubRec(pubrec)).await?;
+                        proto::QoS::ExactlyOnce
+                    }
+                };
+                proto::Publication {
+                    topic_name,
+                    qos,
+                    retain,
+                    payload,
+                }
+            }
+            Err(e) if *e.kind() == ErrorKind::NoSession => {
+                debug!("no session for {}", client_id);
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
+
+        self.sessions
+            .values_mut()
+            .map(|session| session.publish(&publication))
+            .collect::<FuturesUnordered<_>>()
+            .fold(Ok(()), |acc, res| {
+                async move {
+                    match (acc, res) {
+                        (Ok(()), Err(e)) => Err(e),
+                        (a, _) => a,
+                    }
+                }
+            })
+            .await
     }
 
     async fn process_puback(
         &mut self,
-        _client_id: ClientId,
-        _puback: proto::PubAck,
+        client_id: ClientId,
+        puback: proto::PubAck,
     ) -> Result<(), Error> {
-        Ok(())
+        match self.get_session_mut(&client_id) {
+            Ok(session) => session.puback(&puback).await,
+            Err(e) if *e.kind() == ErrorKind::NoSession => {
+                debug!("no session for {}", client_id);
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     async fn process_pubrec(
