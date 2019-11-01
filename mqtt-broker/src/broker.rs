@@ -51,8 +51,8 @@ impl Broker {
     }
 
     async fn process_message(&mut self, message: Message) -> Result<(), Error> {
-        let client_id = message.client_id().clone();
-        let result = match message.into_event() {
+        let (client_id, event) = message.into_parts();
+        let result = match event {
             Event::ConnReq(connreq) => self.process_connect(client_id, connreq).await,
             Event::ConnAck(_) => Ok(info!("broker received CONNACK, ignoring")),
             Event::Disconnect(_) => self.process_disconnect(client_id).await,
@@ -66,7 +66,11 @@ impl Broker {
                 self.process_unsubscribe(client_id, unsubscribe).await
             }
             Event::UnsubAck(_) => Ok(info!("broker received UNSUBACK, ignoring")),
-            Event::Unknown => Ok(info!("broker received unknown event, ignoring")),
+            Event::Publish(publish) => self.process_publish(client_id, publish).await,
+            Event::PubAck(puback) => self.process_puback(client_id, puback).await,
+            Event::PubRec(pubrec) => self.process_pubrec(client_id, pubrec).await,
+            Event::PubRel(pubrel) => self.process_pubrel(client_id, pubrel).await,
+            Event::PubComp(pubcomp) => self.process_pubcomp(client_id, pubcomp).await,
         };
 
         if let Err(e) = result {
@@ -248,6 +252,46 @@ impl Broker {
             }
             Err(e) => Err(e),
         }
+    }
+
+    async fn process_publish(
+        &mut self,
+        _client_id: ClientId,
+        _publish: proto::Publish,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+
+    async fn process_puback(
+        &mut self,
+        _client_id: ClientId,
+        _puback: proto::PubAck,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+
+    async fn process_pubrec(
+        &mut self,
+        _client_id: ClientId,
+        _pubrec: proto::PubRec,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+
+    async fn process_pubrel(
+        &mut self,
+        _client_id: ClientId,
+        _pubrel: proto::PubRel,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+
+    async fn process_pubcomp(
+        &mut self,
+        _client_id: ClientId,
+        _pubcomp: proto::PubComp,
+    ) -> Result<(), Error> {
+        Ok(())
     }
 
     fn get_session_mut(&mut self, client_id: &ClientId) -> Result<&mut Session, Error> {

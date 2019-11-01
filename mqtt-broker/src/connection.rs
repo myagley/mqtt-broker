@@ -204,6 +204,7 @@ where
                         warn!("CONNECT packet received on an already established connection, dropping connection due to protocol violation");
                         return Err(Error::from(ErrorKind::ProtocolViolation));
                     }
+                    Packet::ConnAck(connack) => Event::ConnAck(connack),
                     Packet::Disconnect(disconnect) => {
                         let event = Event::Disconnect(disconnect);
                         let message = Message::new(client_id.clone(), event);
@@ -212,9 +213,16 @@ where
                         return Ok(());
                     }
                     Packet::PingReq(ping) => Event::PingReq(ping),
+                    Packet::PingResp(pingresp) => Event::PingResp(pingresp),
+                    Packet::PubAck(puback) => Event::PubAck(puback),
+                    Packet::PubComp(pubcomp) => Event::PubComp(pubcomp),
+                    Packet::Publish(publish) => Event::Publish(publish),
+                    Packet::PubRec(pubrec) => Event::PubRec(pubrec),
+                    Packet::PubRel(pubrel) => Event::PubRel(pubrel),
                     Packet::Subscribe(subscribe) => Event::Subscribe(subscribe),
+                    Packet::SubAck(suback) => Event::SubAck(suback),
                     Packet::Unsubscribe(unsubscribe) => Event::Unsubscribe(unsubscribe),
-                    _ => Event::Unknown,
+                    Packet::UnsubAck(unsuback) => Event::UnsubAck(unsuback),
                 };
 
                 let message = Message::new(client_id.clone(), event);
@@ -256,13 +264,17 @@ where
                 return Ok(());
             }
             Event::CloseSession => None,
-            Event::PingReq(_) => None,
+            Event::PingReq(req) => Some(Packet::PingReq(req)),
             Event::PingResp(response) => Some(Packet::PingResp(response)),
-            Event::Subscribe(_) => None,
+            Event::Subscribe(sub) => Some(Packet::Subscribe(sub)),
             Event::SubAck(suback) => Some(Packet::SubAck(suback)),
-            Event::Unsubscribe(_) => None,
+            Event::Unsubscribe(unsub) => Some(Packet::Unsubscribe(unsub)),
             Event::UnsubAck(unsuback) => Some(Packet::UnsubAck(unsuback)),
-            Event::Unknown => None,
+            Event::Publish(publish) => Some(Packet::Publish(publish)),
+            Event::PubAck(puback) => Some(Packet::PubAck(puback)),
+            Event::PubRec(pubrec) => Some(Packet::PubRec(pubrec)),
+            Event::PubRel(pubrel) => Some(Packet::PubRel(pubrel)),
+            Event::PubComp(pubcomp) => Some(Packet::PubComp(pubcomp)),
         };
 
         if let Some(packet) = maybe_packet {
