@@ -306,7 +306,9 @@ impl SessionState {
     }
 
     fn allowed_to_send(&self) -> bool {
-        let num_inflight = self.waiting_to_be_acked.len() + self.waiting_to_be_acked_qos0.len();
+        let num_inflight = self.waiting_to_be_acked.len()
+            + self.waiting_to_be_acked_qos0.len()
+            + self.waiting_to_be_completed.len();
         num_inflight < MAX_INFLIGHT_MESSAGES
     }
 
