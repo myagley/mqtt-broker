@@ -301,7 +301,7 @@ impl Broker {
 
         self.sessions
             .values_mut()
-            .map(|session| session.publish(&publication))
+            .map(|session| session.publish_to(&publication))
             .collect::<FuturesUnordered<_>>()
             .fold(Ok(()), |acc, res| {
                 async move {

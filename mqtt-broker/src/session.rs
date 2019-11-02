@@ -35,8 +35,8 @@ impl ConnectedSession {
         (self.state, self.handle)
     }
 
-    pub async fn publish(&mut self, publication: proto::Publication) -> Result<(), Error> {
-        if let Some(event) = self.state.publish(publication)? {
+    pub async fn publish_to(&mut self, publication: proto::Publication) -> Result<(), Error> {
+        if let Some(event) = self.state.publish_to(publication)? {
             self.send(event).await?;
         }
         Ok(())
@@ -120,7 +120,7 @@ impl OfflineSession {
         Self { state }
     }
 
-    pub fn publish(&mut self, publication: proto::Publication) -> Result<(), Error> {
+    pub fn publish_to(&mut self, publication: proto::Publication) -> Result<(), Error> {
         self.state.queue_publish(publication)
     }
 
@@ -180,7 +180,7 @@ impl SessionState {
 
     /// Takes a publication and returns an optional Publish packet if sending is allowed.
     /// This can return None if the current outstanding messages is at its limit.
-    pub fn publish(&mut self, publication: proto::Publication) -> Result<Option<Event>, Error> {
+    pub fn publish_to(&mut self, publication: proto::Publication) -> Result<Option<Event>, Error> {
         if let Some(publication) = self.filter(publication) {
             if self.allowed_to_send() {
                 let event = self.prepare_to_send(publication)?;
@@ -316,11 +316,11 @@ impl Session {
         Session::Offline(offline)
     }
 
-    pub async fn publish(&mut self, publication: &proto::Publication) -> Result<(), Error> {
+    pub async fn publish_to(&mut self, publication: &proto::Publication) -> Result<(), Error> {
         match self {
-            Session::Transient(connected) => connected.publish(publication.to_owned()).await,
-            Session::Persistent(connected) => connected.publish(publication.to_owned()).await,
-            Session::Offline(offline) => offline.publish(publication.to_owned()),
+            Session::Transient(connected) => connected.publish_to(publication.to_owned()).await,
+            Session::Persistent(connected) => connected.publish_to(publication.to_owned()).await,
+            Session::Offline(offline) => offline.publish_to(publication.to_owned()),
             Session::Disconnecting(_, _) => Err(Error::from(ErrorKind::SessionOffline)),
         }
     }
