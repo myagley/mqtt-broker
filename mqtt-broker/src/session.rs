@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::time::{Duration, Instant};
 use std::{cmp, fmt, mem};
 
@@ -42,6 +42,18 @@ impl ConnectedSession {
         self.state.handle_publish(publish)
     }
 
+    pub fn handle_puback(&mut self, puback: &proto::PubAck) -> Result<Option<Event>, Error> {
+        self.state.handle_puback(puback)
+    }
+
+    pub fn handle_puback0(&mut self, id: proto::PacketIdentifier) -> Result<Option<Event>, Error> {
+        self.state.handle_puback0(id)
+    }
+
+    pub fn handle_pubrec(&mut self, pubrec: proto::PubRec) -> Result<Option<Event>, Error> {
+        self.state.handle_pubrec(pubrec)
+    }
+
     pub fn handle_pubrel(
         &mut self,
         pubrel: proto::PubRel,
@@ -49,22 +61,12 @@ impl ConnectedSession {
         self.state.handle_pubrel(pubrel)
     }
 
+    pub fn handle_pubcomp(&mut self, pubcomp: proto::PubComp) -> Result<Option<Event>, Error> {
+        self.state.handle_pubcomp(pubcomp)
+    }
+
     pub async fn publish_to(&mut self, publication: proto::Publication) -> Result<(), Error> {
         if let Some(event) = self.state.publish_to(publication)? {
-            self.send(event).await?;
-        }
-        Ok(())
-    }
-
-    pub async fn puback0(&mut self, id: proto::PacketIdentifier) -> Result<(), Error> {
-        if let Some(event) = self.state.puback0(id)? {
-            self.send(event).await?;
-        }
-        Ok(())
-    }
-
-    pub async fn puback(&mut self, puback: &proto::PubAck) -> Result<(), Error> {
-        if let Some(event) = self.state.puback(puback)? {
             self.send(event).await?;
         }
         Ok(())
@@ -156,6 +158,7 @@ pub struct SessionState {
     waiting_to_be_acked: BTreeMap<proto::PacketIdentifier, Publish>,
     waiting_to_be_acked_qos0: BTreeMap<proto::PacketIdentifier, Publish>,
     waiting_to_be_released: BTreeMap<proto::PacketIdentifier, proto::Publish>,
+    waiting_to_be_completed: BTreeSet<proto::PacketIdentifier>,
 }
 
 impl SessionState {
@@ -172,6 +175,7 @@ impl SessionState {
             waiting_to_be_acked: BTreeMap::new(),
             waiting_to_be_acked_qos0: BTreeMap::new(),
             waiting_to_be_released: BTreeMap::new(),
+            waiting_to_be_completed: BTreeSet::new(),
         }
     }
 
@@ -230,6 +234,16 @@ impl SessionState {
         Ok(result)
     }
 
+    pub fn handle_pubrec(&mut self, pubrec: proto::PubRec) -> Result<Option<Event>, Error> {
+        self.waiting_to_be_acked.remove(&pubrec.packet_identifier);
+        self.waiting_to_be_completed
+            .insert(pubrec.packet_identifier);
+        let pubrel = proto::PubRel {
+            packet_identifier: pubrec.packet_identifier,
+        };
+        Ok(Some(Event::PubRel(pubrel)))
+    }
+
     pub fn handle_pubrel(
         &mut self,
         pubrel: proto::PubRel,
@@ -244,6 +258,13 @@ impl SessionState {
                 payload: publish.payload,
             });
         Ok(publication)
+    }
+
+    pub fn handle_pubcomp(&mut self, pubcomp: proto::PubComp) -> Result<Option<Event>, Error> {
+        self.waiting_to_be_completed
+            .remove(&pubcomp.packet_identifier);
+        self.packet_identifiers.discard(pubcomp.packet_identifier);
+        self.try_publish()
     }
 
     /// Takes a publication and returns an optional Publish packet if sending is allowed.
@@ -262,14 +283,14 @@ impl SessionState {
         }
     }
 
-    pub fn puback(&mut self, puback: &proto::PubAck) -> Result<Option<Event>, Error> {
+    pub fn handle_puback(&mut self, puback: &proto::PubAck) -> Result<Option<Event>, Error> {
         debug!("discarding packet identifier {}", puback.packet_identifier);
         self.waiting_to_be_acked.remove(&puback.packet_identifier);
         self.packet_identifiers.discard(puback.packet_identifier);
         self.try_publish()
     }
 
-    pub fn puback0(&mut self, id: proto::PacketIdentifier) -> Result<Option<Event>, Error> {
+    pub fn handle_puback0(&mut self, id: proto::PacketIdentifier) -> Result<Option<Event>, Error> {
         debug!("discarding QoS 0 packet identifier {}", id);
         self.waiting_to_be_acked_qos0.remove(&id);
         self.packet_identifiers_qos0.discard(id);
@@ -396,6 +417,33 @@ impl Session {
         }
     }
 
+    pub fn handle_puback(&mut self, puback: &proto::PubAck) -> Result<Option<Event>, Error> {
+        match self {
+            Session::Transient(connected) => connected.handle_puback(puback),
+            Session::Persistent(connected) => connected.handle_puback(puback),
+            Session::Offline(_offline) => Err(Error::from(ErrorKind::SessionOffline)),
+            Session::Disconnecting(_, _) => Err(Error::from(ErrorKind::SessionOffline)),
+        }
+    }
+
+    pub fn handle_puback0(&mut self, id: proto::PacketIdentifier) -> Result<Option<Event>, Error> {
+        match self {
+            Session::Transient(connected) => connected.handle_puback0(id),
+            Session::Persistent(connected) => connected.handle_puback0(id),
+            Session::Offline(_offline) => Err(Error::from(ErrorKind::SessionOffline)),
+            Session::Disconnecting(_, _) => Err(Error::from(ErrorKind::SessionOffline)),
+        }
+    }
+
+    pub fn handle_pubrec(&mut self, pubrec: proto::PubRec) -> Result<Option<Event>, Error> {
+        match self {
+            Session::Transient(connected) => connected.handle_pubrec(pubrec),
+            Session::Persistent(connected) => connected.handle_pubrec(pubrec),
+            Session::Offline(_offline) => Err(Error::from(ErrorKind::SessionOffline)),
+            Session::Disconnecting(_, _) => Err(Error::from(ErrorKind::SessionOffline)),
+        }
+    }
+
     pub fn handle_pubrel(
         &mut self,
         pubrel: proto::PubRel,
@@ -408,29 +456,20 @@ impl Session {
         }
     }
 
+    pub fn handle_pubcomp(&mut self, pubcomp: proto::PubComp) -> Result<Option<Event>, Error> {
+        match self {
+            Session::Transient(connected) => connected.handle_pubcomp(pubcomp),
+            Session::Persistent(connected) => connected.handle_pubcomp(pubcomp),
+            Session::Offline(_offline) => Err(Error::from(ErrorKind::SessionOffline)),
+            Session::Disconnecting(_, _) => Err(Error::from(ErrorKind::SessionOffline)),
+        }
+    }
+
     pub async fn publish_to(&mut self, publication: &proto::Publication) -> Result<(), Error> {
         match self {
             Session::Transient(connected) => connected.publish_to(publication.to_owned()).await,
             Session::Persistent(connected) => connected.publish_to(publication.to_owned()).await,
             Session::Offline(offline) => offline.publish_to(publication.to_owned()),
-            Session::Disconnecting(_, _) => Err(Error::from(ErrorKind::SessionOffline)),
-        }
-    }
-
-    pub async fn puback(&mut self, puback: &proto::PubAck) -> Result<(), Error> {
-        match self {
-            Session::Transient(connected) => connected.puback(puback).await,
-            Session::Persistent(connected) => connected.puback(puback).await,
-            Session::Offline(_offline) => Err(Error::from(ErrorKind::SessionOffline)),
-            Session::Disconnecting(_, _) => Err(Error::from(ErrorKind::SessionOffline)),
-        }
-    }
-
-    pub async fn puback0(&mut self, id: proto::PacketIdentifier) -> Result<(), Error> {
-        match self {
-            Session::Transient(connected) => connected.puback0(id).await,
-            Session::Persistent(connected) => connected.puback0(id).await,
-            Session::Offline(_offline) => Err(Error::from(ErrorKind::SessionOffline)),
             Session::Disconnecting(_, _) => Err(Error::from(ErrorKind::SessionOffline)),
         }
     }

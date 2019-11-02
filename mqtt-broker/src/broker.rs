@@ -297,13 +297,18 @@ impl Broker {
         Ok(())
     }
 
-    async fn process_puback0(
+    async fn process_puback(
         &mut self,
         client_id: ClientId,
-        id: proto::PacketIdentifier,
+        puback: proto::PubAck,
     ) -> Result<(), Error> {
         match self.get_session_mut(&client_id) {
-            Ok(session) => session.puback0(id).await,
+            Ok(session) => {
+                if let Some(event) = session.handle_puback(&puback)? {
+                    session.send(event).await?
+                }
+                Ok(())
+            }
             Err(e) if *e.kind() == ErrorKind::NoSession => {
                 debug!("no session for {}", client_id);
                 Ok(())
@@ -312,13 +317,18 @@ impl Broker {
         }
     }
 
-    async fn process_puback(
+    async fn process_puback0(
         &mut self,
         client_id: ClientId,
-        puback: proto::PubAck,
+        id: proto::PacketIdentifier,
     ) -> Result<(), Error> {
         match self.get_session_mut(&client_id) {
-            Ok(session) => session.puback(&puback).await,
+            Ok(session) => {
+                if let Some(event) = session.handle_puback0(id)? {
+                    session.send(event).await?
+                }
+                Ok(())
+            }
             Err(e) if *e.kind() == ErrorKind::NoSession => {
                 debug!("no session for {}", client_id);
                 Ok(())
@@ -329,10 +339,22 @@ impl Broker {
 
     async fn process_pubrec(
         &mut self,
-        _client_id: ClientId,
-        _pubrec: proto::PubRec,
+        client_id: ClientId,
+        pubrec: proto::PubRec,
     ) -> Result<(), Error> {
-        Ok(())
+        match self.get_session_mut(&client_id) {
+            Ok(session) => {
+                if let Some(event) = session.handle_pubrec(pubrec)? {
+                    session.send(event).await?
+                }
+                Ok(())
+            }
+            Err(e) if *e.kind() == ErrorKind::NoSession => {
+                debug!("no session for {}", client_id);
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     async fn process_pubrel(
@@ -376,10 +398,22 @@ impl Broker {
 
     async fn process_pubcomp(
         &mut self,
-        _client_id: ClientId,
-        _pubcomp: proto::PubComp,
+        client_id: ClientId,
+        pubcomp: proto::PubComp,
     ) -> Result<(), Error> {
-        Ok(())
+        match self.get_session_mut(&client_id) {
+            Ok(session) => {
+                if let Some(event) = session.handle_pubcomp(pubcomp)? {
+                    session.send(event).await?
+                }
+                Ok(())
+            }
+            Err(e) if *e.kind() == ErrorKind::NoSession => {
+                debug!("no session for {}", client_id);
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     fn get_session_mut(&mut self, client_id: &ClientId) -> Result<&mut Session, Error> {
