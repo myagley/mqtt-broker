@@ -264,33 +264,13 @@ impl Broker {
         client_id: ClientId,
         publish: proto::Publish,
     ) -> Result<(), Error> {
-        let publication = match self.get_session_mut(&client_id) {
+        let maybe_publication = match self.get_session_mut(&client_id) {
             Ok(session) => {
-                let proto::Publish {
-                    packet_identifier_dup_qos: pidq,
-                    retain,
-                    topic_name,
-                    payload,
-                } = publish;
-                let qos = match pidq {
-                    proto::PacketIdentifierDupQoS::AtMostOnce => proto::QoS::AtMostOnce,
-                    proto::PacketIdentifierDupQoS::AtLeastOnce(packet_identifier, _dup) => {
-                        let puback = proto::PubAck { packet_identifier };
-                        session.send(Event::PubAck(puback)).await?;
-                        proto::QoS::AtLeastOnce
-                    }
-                    proto::PacketIdentifierDupQoS::ExactlyOnce(packet_identifier, _dup) => {
-                        let pubrec = proto::PubRec { packet_identifier };
-                        session.send(Event::PubRec(pubrec)).await?;
-                        proto::QoS::ExactlyOnce
-                    }
-                };
-                proto::Publication {
-                    topic_name,
-                    qos,
-                    retain,
-                    payload,
+                let (maybe_publication, maybe_event) = session.handle_publish(publish)?;
+                if let Some(event) = maybe_event {
+                    session.send(event).await?;
                 }
+                maybe_publication
             }
             Err(e) if *e.kind() == ErrorKind::NoSession => {
                 debug!("no session for {}", client_id);
@@ -299,19 +279,22 @@ impl Broker {
             Err(e) => return Err(e),
         };
 
-        self.sessions
-            .values_mut()
-            .map(|session| session.publish_to(&publication))
-            .collect::<FuturesUnordered<_>>()
-            .fold(Ok(()), |acc, res| {
-                async move {
-                    match (acc, res) {
-                        (Ok(()), Err(e)) => Err(e),
-                        (a, _) => a,
+        if let Some(publication) = maybe_publication {
+            self.sessions
+                .values_mut()
+                .map(|session| session.publish_to(&publication))
+                .collect::<FuturesUnordered<_>>()
+                .fold(Ok(()), |acc, res| {
+                    async move {
+                        match (acc, res) {
+                            (Ok(()), Err(e)) => Err(e),
+                            (a, _) => a,
+                        }
                     }
-                }
-            })
-            .await
+                })
+                .await?
+        }
+        Ok(())
     }
 
     async fn process_puback0(
@@ -354,9 +337,40 @@ impl Broker {
 
     async fn process_pubrel(
         &mut self,
-        _client_id: ClientId,
-        _pubrel: proto::PubRel,
+        client_id: ClientId,
+        pubrel: proto::PubRel,
     ) -> Result<(), Error> {
+        let maybe_publication = match self.get_session_mut(&client_id) {
+            Ok(session) => {
+                let packet_identifier = pubrel.packet_identifier;
+                let maybe_publication = session.handle_pubrel(pubrel)?;
+
+                let pubcomp = proto::PubComp { packet_identifier };
+                session.send(Event::PubComp(pubcomp)).await?;
+                maybe_publication
+            }
+            Err(e) if *e.kind() == ErrorKind::NoSession => {
+                debug!("no session for {}", client_id);
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
+
+        if let Some(publication) = maybe_publication {
+            self.sessions
+                .values_mut()
+                .map(|session| session.publish_to(&publication))
+                .collect::<FuturesUnordered<_>>()
+                .fold(Ok(()), |acc, res| {
+                    async move {
+                        match (acc, res) {
+                            (Ok(()), Err(e)) => Err(e),
+                            (a, _) => a,
+                        }
+                    }
+                })
+                .await?
+        }
         Ok(())
     }
 

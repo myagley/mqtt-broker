@@ -35,6 +35,20 @@ impl ConnectedSession {
         (self.state, self.handle)
     }
 
+    pub fn handle_publish(
+        &mut self,
+        publish: proto::Publish,
+    ) -> Result<(Option<proto::Publication>, Option<Event>), Error> {
+        self.state.handle_publish(publish)
+    }
+
+    pub fn handle_pubrel(
+        &mut self,
+        pubrel: proto::PubRel,
+    ) -> Result<Option<proto::Publication>, Error> {
+        self.state.handle_pubrel(pubrel)
+    }
+
     pub async fn publish_to(&mut self, publication: proto::Publication) -> Result<(), Error> {
         if let Some(event) = self.state.publish_to(publication)? {
             self.send(event).await?;
@@ -141,6 +155,7 @@ pub struct SessionState {
     waiting_to_be_sent: VecDeque<proto::Publication>,
     waiting_to_be_acked: BTreeMap<proto::PacketIdentifier, Publish>,
     waiting_to_be_acked_qos0: BTreeMap<proto::PacketIdentifier, Publish>,
+    waiting_to_be_released: BTreeMap<proto::PacketIdentifier, proto::Publish>,
 }
 
 impl SessionState {
@@ -156,6 +171,7 @@ impl SessionState {
             waiting_to_be_sent: VecDeque::new(),
             waiting_to_be_acked: BTreeMap::new(),
             waiting_to_be_acked_qos0: BTreeMap::new(),
+            waiting_to_be_released: BTreeMap::new(),
         }
     }
 
@@ -176,6 +192,58 @@ impl SessionState {
             self.waiting_to_be_sent.push_back(publication);
         }
         Ok(())
+    }
+
+    pub fn handle_publish(
+        &mut self,
+        publish: proto::Publish,
+    ) -> Result<(Option<proto::Publication>, Option<Event>), Error> {
+        let result = match publish.packet_identifier_dup_qos {
+            proto::PacketIdentifierDupQoS::AtMostOnce => {
+                let publication = proto::Publication {
+                    topic_name: publish.topic_name,
+                    qos: proto::QoS::AtMostOnce,
+                    retain: false,
+                    payload: publish.payload,
+                };
+                (Some(publication), None)
+            }
+            proto::PacketIdentifierDupQoS::AtLeastOnce(packet_identifier, _dup) => {
+                let publication = proto::Publication {
+                    topic_name: publish.topic_name,
+                    qos: proto::QoS::AtLeastOnce,
+                    retain: false,
+                    payload: publish.payload,
+                };
+                let puback = proto::PubAck { packet_identifier };
+                let event = Event::PubAck(puback);
+                (Some(publication), Some(event))
+            }
+            proto::PacketIdentifierDupQoS::ExactlyOnce(packet_identifier, _dup) => {
+                self.waiting_to_be_released
+                    .insert(packet_identifier, publish);
+                let pubrec = proto::PubRec { packet_identifier };
+                let event = Event::PubRec(pubrec);
+                (None, Some(event))
+            }
+        };
+        Ok(result)
+    }
+
+    pub fn handle_pubrel(
+        &mut self,
+        pubrel: proto::PubRel,
+    ) -> Result<Option<proto::Publication>, Error> {
+        let publication = self
+            .waiting_to_be_released
+            .remove(&pubrel.packet_identifier)
+            .map(|publish| proto::Publication {
+                topic_name: publish.topic_name,
+                qos: proto::QoS::ExactlyOnce,
+                retain: false,
+                payload: publish.payload,
+            });
+        Ok(publication)
     }
 
     /// Takes a publication and returns an optional Publish packet if sending is allowed.
@@ -314,6 +382,30 @@ impl Session {
     pub fn new_offline(state: SessionState) -> Self {
         let offline = OfflineSession::new(state);
         Session::Offline(offline)
+    }
+
+    pub fn handle_publish(
+        &mut self,
+        publish: proto::Publish,
+    ) -> Result<(Option<proto::Publication>, Option<Event>), Error> {
+        match self {
+            Session::Transient(connected) => connected.handle_publish(publish),
+            Session::Persistent(connected) => connected.handle_publish(publish),
+            Session::Offline(_offline) => Err(Error::from(ErrorKind::SessionOffline)),
+            Session::Disconnecting(_, _) => Err(Error::from(ErrorKind::SessionOffline)),
+        }
+    }
+
+    pub fn handle_pubrel(
+        &mut self,
+        pubrel: proto::PubRel,
+    ) -> Result<Option<proto::Publication>, Error> {
+        match self {
+            Session::Transient(connected) => connected.handle_pubrel(pubrel),
+            Session::Persistent(connected) => connected.handle_pubrel(pubrel),
+            Session::Offline(_offline) => Err(Error::from(ErrorKind::SessionOffline)),
+            Session::Disconnecting(_, _) => Err(Error::from(ErrorKind::SessionOffline)),
+        }
     }
 
     pub async fn publish_to(&mut self, publication: &proto::Publication) -> Result<(), Error> {
