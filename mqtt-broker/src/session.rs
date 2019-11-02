@@ -65,11 +65,8 @@ impl ConnectedSession {
         self.state.handle_pubcomp(pubcomp)
     }
 
-    pub async fn publish_to(&mut self, publication: proto::Publication) -> Result<(), Error> {
-        if let Some(event) = self.state.publish_to(publication)? {
-            self.send(event).await?;
-        }
-        Ok(())
+    pub fn publish_to(&mut self, publication: proto::Publication) -> Result<Option<Event>, Error> {
+        self.state.publish_to(publication)
     }
 
     pub fn subscribe(&mut self, subscribe: proto::Subscribe) -> Result<proto::SubAck, Error> {
@@ -136,8 +133,9 @@ impl OfflineSession {
         Self { state }
     }
 
-    pub fn publish_to(&mut self, publication: proto::Publication) -> Result<(), Error> {
-        self.state.queue_publish(publication)
+    pub fn publish_to(&mut self, publication: proto::Publication) -> Result<Option<Event>, Error> {
+        self.state.queue_publish(publication)?;
+        Ok(None)
     }
 
     pub fn into_state(self) -> SessionState {
@@ -196,6 +194,22 @@ impl SessionState {
             self.waiting_to_be_sent.push_back(publication);
         }
         Ok(())
+    }
+
+    /// Takes a publication and returns an optional Publish packet if sending is allowed.
+    /// This can return None if the current outstanding messages is at its limit.
+    pub fn publish_to(&mut self, publication: proto::Publication) -> Result<Option<Event>, Error> {
+        if let Some(publication) = self.filter(publication) {
+            if self.allowed_to_send() {
+                let event = self.prepare_to_send(publication)?;
+                Ok(Some(event))
+            } else {
+                self.waiting_to_be_sent.push_back(publication);
+                Ok(None)
+            }
+        } else {
+            Ok(None)
+        }
     }
 
     pub fn handle_publish(
@@ -265,22 +279,6 @@ impl SessionState {
             .remove(&pubcomp.packet_identifier);
         self.packet_identifiers.discard(pubcomp.packet_identifier);
         self.try_publish()
-    }
-
-    /// Takes a publication and returns an optional Publish packet if sending is allowed.
-    /// This can return None if the current outstanding messages is at its limit.
-    pub fn publish_to(&mut self, publication: proto::Publication) -> Result<Option<Event>, Error> {
-        if let Some(publication) = self.filter(publication) {
-            if self.allowed_to_send() {
-                let event = self.prepare_to_send(publication)?;
-                Ok(Some(event))
-            } else {
-                self.waiting_to_be_sent.push_back(publication);
-                Ok(None)
-            }
-        } else {
-            Ok(None)
-        }
     }
 
     pub fn handle_puback(&mut self, puback: &proto::PubAck) -> Result<Option<Event>, Error> {
@@ -465,10 +463,10 @@ impl Session {
         }
     }
 
-    pub async fn publish_to(&mut self, publication: &proto::Publication) -> Result<(), Error> {
+    pub fn publish_to(&mut self, publication: &proto::Publication) -> Result<Option<Event>, Error> {
         match self {
-            Session::Transient(connected) => connected.publish_to(publication.to_owned()).await,
-            Session::Persistent(connected) => connected.publish_to(publication.to_owned()).await,
+            Session::Transient(connected) => connected.publish_to(publication.to_owned()),
+            Session::Persistent(connected) => connected.publish_to(publication.to_owned()),
             Session::Offline(offline) => offline.publish_to(publication.to_owned()),
             Session::Disconnecting(_, _) => Err(Error::from(ErrorKind::SessionOffline)),
         }

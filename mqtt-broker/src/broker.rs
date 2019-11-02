@@ -282,7 +282,7 @@ impl Broker {
         if let Some(publication) = maybe_publication {
             self.sessions
                 .values_mut()
-                .map(|session| session.publish_to(&publication))
+                .map(|session| publish_to(session, &publication))
                 .collect::<FuturesUnordered<_>>()
                 .fold(Ok(()), |acc, res| {
                     async move {
@@ -381,7 +381,7 @@ impl Broker {
         if let Some(publication) = maybe_publication {
             self.sessions
                 .values_mut()
-                .map(|session| session.publish_to(&publication))
+                .map(|session| publish_to(session, &publication))
                 .collect::<FuturesUnordered<_>>()
                 .fold(Ok(()), |acc, res| {
                     async move {
@@ -569,6 +569,13 @@ impl Broker {
             _ => None,
         }
     }
+}
+
+async fn publish_to(session: &mut Session, publication: &proto::Publication) -> Result<(), Error> {
+    if let Some(event) = session.publish_to(&publication)? {
+        session.send(event).await?
+    }
+    Ok(())
 }
 
 impl Default for Broker {
