@@ -457,9 +457,9 @@ impl Broker {
 
                 Ok(ack)
             }
-            Some(Session::Disconnecting(client_id, handle)) => Err(
-                SessionError::ProtocolViolation(Session::Disconnecting(client_id, handle)),
-            ),
+            Some(Session::Disconnecting(disconnecting)) => Err(SessionError::ProtocolViolation(
+                Session::Disconnecting(disconnecting),
+            )),
             None => {
                 // No session present - create a new one.
                 let new_session = if let proto::ClientId::IdWithExistingSession(_) =
@@ -513,21 +513,20 @@ impl Broker {
             );
 
             let client_id = connreq.client_id().clone();
-            let (state, will, handle) = current_connected.into_parts();
-            let (new_session, old_session, session_present) =
+            let (state, _will, handle) = current_connected.into_parts();
+            let old_session = Session::new_disconnecting(client_id.clone(), None, handle);
+            let (new_session, session_present) =
                 if let proto::ClientId::IdWithExistingSession(_) = connreq.connect().client_id {
                     debug!(
                         "moving persistent session to this connection for {}",
                         client_id
                     );
-                    let old_session = Session::Disconnecting(connreq.client_id().clone(), handle);
                     let new_session = Session::new_persistent(connreq, state);
-                    (new_session, old_session, true)
+                    (new_session, true)
                 } else {
                     info!("cleaning session for {}", client_id);
-                    let old_session = Session::Disconnecting(connreq.client_id().clone(), handle);
                     let new_session = Session::new_transient(connreq);
-                    (new_session, old_session, false)
+                    (new_session, false)
                 };
 
             self.sessions.insert(client_id, new_session);
@@ -544,10 +543,8 @@ impl Broker {
         match self.sessions.remove(client_id) {
             Some(Session::Transient(connected)) => {
                 debug!("closing transient session for {}", client_id);
-                Some(Session::Disconnecting(
-                    client_id.clone(),
-                    connected.into_handle(),
-                ))
+                let (_state, will, handle) = connected.into_parts();
+                Some(Session::new_disconnecting(client_id.clone(), will, handle))
             }
             Some(Session::Persistent(connected)) => {
                 // Move a persistent session into the offline state
@@ -558,7 +555,7 @@ impl Broker {
                 let (state, will, handle) = connected.into_parts();
                 let new_session = Session::new_offline(state);
                 self.sessions.insert(client_id.clone(), new_session);
-                Some(Session::Disconnecting(client_id.clone(), handle))
+                Some(Session::new_disconnecting(client_id.clone(), will, handle))
             }
             Some(Session::Offline(offline)) => {
                 debug!("closing already offline session for {}", client_id);

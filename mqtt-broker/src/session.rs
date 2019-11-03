@@ -36,10 +36,6 @@ impl ConnectedSession {
         &self.handle
     }
 
-    pub fn into_handle(self) -> ConnectionHandle {
-        self.handle
-    }
-
     pub fn into_parts(self) -> (SessionState, Option<proto::Publication>, ConnectionHandle) {
         (self.state, self.will, self.handle)
     }
@@ -149,6 +145,44 @@ impl OfflineSession {
 
     pub fn into_state(self) -> SessionState {
         self.state
+    }
+}
+
+#[derive(Debug)]
+pub struct DisconnectingSession {
+    client_id: ClientId,
+    will: Option<proto::Publication>,
+    handle: ConnectionHandle,
+}
+
+impl DisconnectingSession {
+    fn new(
+        client_id: ClientId,
+        will: Option<proto::Publication>,
+        handle: ConnectionHandle,
+    ) -> Self {
+        Self {
+            client_id,
+            will,
+            handle,
+        }
+    }
+
+    pub fn client_id(&self) -> &ClientId {
+        &self.client_id
+    }
+
+    pub fn will(&self) -> Option<&proto::Publication> {
+        self.will.as_ref()
+    }
+
+    async fn send(&mut self, event: Event) -> Result<(), Error> {
+        let message = Message::new(self.client_id.clone(), event);
+        self.handle
+            .send(message)
+            .await
+            .context(ErrorKind::SendConnectionMessage)?;
+        Ok(())
     }
 }
 
@@ -393,7 +427,7 @@ impl SessionState {
 pub enum Session {
     Transient(ConnectedSession),
     Persistent(ConnectedSession),
-    Disconnecting(ClientId, ConnectionHandle),
+    Disconnecting(DisconnectingSession),
     Offline(OfflineSession),
 }
 
@@ -416,6 +450,15 @@ impl Session {
         Session::Offline(offline)
     }
 
+    pub fn new_disconnecting(
+        client_id: ClientId,
+        will: Option<proto::Publication>,
+        handle: ConnectionHandle,
+    ) -> Self {
+        let disconnecting = DisconnectingSession::new(client_id, will, handle);
+        Session::Disconnecting(disconnecting)
+    }
+
     pub fn handle_publish(
         &mut self,
         publish: proto::Publish,
@@ -424,7 +467,7 @@ impl Session {
             Session::Transient(connected) => connected.handle_publish(publish),
             Session::Persistent(connected) => connected.handle_publish(publish),
             Session::Offline(_offline) => Err(Error::from(ErrorKind::SessionOffline)),
-            Session::Disconnecting(_, _) => Err(Error::from(ErrorKind::SessionOffline)),
+            Session::Disconnecting(_) => Err(Error::from(ErrorKind::SessionOffline)),
         }
     }
 
@@ -433,7 +476,7 @@ impl Session {
             Session::Transient(connected) => connected.handle_puback(puback),
             Session::Persistent(connected) => connected.handle_puback(puback),
             Session::Offline(_offline) => Err(Error::from(ErrorKind::SessionOffline)),
-            Session::Disconnecting(_, _) => Err(Error::from(ErrorKind::SessionOffline)),
+            Session::Disconnecting(_) => Err(Error::from(ErrorKind::SessionOffline)),
         }
     }
 
@@ -442,7 +485,7 @@ impl Session {
             Session::Transient(connected) => connected.handle_puback0(id),
             Session::Persistent(connected) => connected.handle_puback0(id),
             Session::Offline(_offline) => Err(Error::from(ErrorKind::SessionOffline)),
-            Session::Disconnecting(_, _) => Err(Error::from(ErrorKind::SessionOffline)),
+            Session::Disconnecting(_) => Err(Error::from(ErrorKind::SessionOffline)),
         }
     }
 
@@ -451,7 +494,7 @@ impl Session {
             Session::Transient(connected) => connected.handle_pubrec(pubrec),
             Session::Persistent(connected) => connected.handle_pubrec(pubrec),
             Session::Offline(_offline) => Err(Error::from(ErrorKind::SessionOffline)),
-            Session::Disconnecting(_, _) => Err(Error::from(ErrorKind::SessionOffline)),
+            Session::Disconnecting(_) => Err(Error::from(ErrorKind::SessionOffline)),
         }
     }
 
@@ -463,7 +506,7 @@ impl Session {
             Session::Transient(connected) => connected.handle_pubrel(pubrel),
             Session::Persistent(connected) => connected.handle_pubrel(pubrel),
             Session::Offline(_offline) => Err(Error::from(ErrorKind::SessionOffline)),
-            Session::Disconnecting(_, _) => Err(Error::from(ErrorKind::SessionOffline)),
+            Session::Disconnecting(_) => Err(Error::from(ErrorKind::SessionOffline)),
         }
     }
 
@@ -472,7 +515,7 @@ impl Session {
             Session::Transient(connected) => connected.handle_pubcomp(pubcomp),
             Session::Persistent(connected) => connected.handle_pubcomp(pubcomp),
             Session::Offline(_offline) => Err(Error::from(ErrorKind::SessionOffline)),
-            Session::Disconnecting(_, _) => Err(Error::from(ErrorKind::SessionOffline)),
+            Session::Disconnecting(_) => Err(Error::from(ErrorKind::SessionOffline)),
         }
     }
 
@@ -481,7 +524,7 @@ impl Session {
             Session::Transient(connected) => connected.publish_to(publication.to_owned()),
             Session::Persistent(connected) => connected.publish_to(publication.to_owned()),
             Session::Offline(offline) => offline.publish_to(publication.to_owned()),
-            Session::Disconnecting(_, _) => Err(Error::from(ErrorKind::SessionOffline)),
+            Session::Disconnecting(_) => Err(Error::from(ErrorKind::SessionOffline)),
         }
     }
 
@@ -490,7 +533,7 @@ impl Session {
             Session::Transient(connected) => connected.subscribe(subscribe),
             Session::Persistent(connected) => connected.subscribe(subscribe),
             Session::Offline(_) => Err(Error::from(ErrorKind::SessionOffline)),
-            Session::Disconnecting(_, _) => Err(Error::from(ErrorKind::SessionOffline)),
+            Session::Disconnecting(_) => Err(Error::from(ErrorKind::SessionOffline)),
         }
     }
 
@@ -502,7 +545,7 @@ impl Session {
             Session::Transient(connected) => connected.unsubscribe(unsubscribe),
             Session::Persistent(connected) => connected.unsubscribe(unsubscribe),
             Session::Offline(_) => Err(Error::from(ErrorKind::SessionOffline)),
-            Session::Disconnecting(_, _) => Err(Error::from(ErrorKind::SessionOffline)),
+            Session::Disconnecting(_) => Err(Error::from(ErrorKind::SessionOffline)),
         }
     }
 
@@ -510,14 +553,7 @@ impl Session {
         match self {
             Session::Transient(ref mut connected) => connected.send(event).await,
             Session::Persistent(ref mut connected) => connected.send(event).await,
-            Session::Disconnecting(ref client_id, ref mut handle) => {
-                let message = Message::new(client_id.clone(), event);
-                handle
-                    .send(message)
-                    .await
-                    .context(ErrorKind::SendConnectionMessage)?;
-                Ok(())
-            }
+            Session::Disconnecting(ref mut disconnecting) => disconnecting.send(event).await,
             _ => Err(ErrorKind::SessionOffline.into()),
         }
     }
