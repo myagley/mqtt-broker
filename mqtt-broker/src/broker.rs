@@ -188,6 +188,11 @@ impl Broker {
         debug!("handling drop connection...");
         if let Some(mut session) = self.close_session(&client_id) {
             session.send(Event::DropConnection).await?;
+
+            // Ungraceful disconnect - send the will
+            if let Some(ref will) = session.will() {
+                self.publish_all(will).await?;
+            }
         } else {
             debug!("no session for {}", client_id);
         }
@@ -197,8 +202,13 @@ impl Broker {
 
     async fn process_close_session(&mut self, client_id: ClientId) -> Result<(), Error> {
         debug!("handling close session...");
-        if self.close_session(&client_id).is_some() {
+        if let Some(session) = self.close_session(&client_id) {
             debug!("session removed");
+
+            // Ungraceful disconnect - send the will
+            if let Some(ref will) = session.will() {
+                self.publish_all(will).await?;
+            }
         } else {
             debug!("no session for {}", client_id);
         }
@@ -280,19 +290,7 @@ impl Broker {
         };
 
         if let Some(publication) = maybe_publication {
-            self.sessions
-                .values_mut()
-                .map(|session| publish_to(session, &publication))
-                .collect::<FuturesUnordered<_>>()
-                .fold(Ok(()), |acc, res| {
-                    async move {
-                        match (acc, res) {
-                            (Ok(()), Err(e)) => Err(e),
-                            (a, _) => a,
-                        }
-                    }
-                })
-                .await?
+            self.publish_all(&publication).await?
         }
         Ok(())
     }
@@ -379,19 +377,7 @@ impl Broker {
         };
 
         if let Some(publication) = maybe_publication {
-            self.sessions
-                .values_mut()
-                .map(|session| publish_to(session, &publication))
-                .collect::<FuturesUnordered<_>>()
-                .fold(Ok(()), |acc, res| {
-                    async move {
-                        match (acc, res) {
-                            (Ok(()), Err(e)) => Err(e),
-                            (a, _) => a,
-                        }
-                    }
-                })
-                .await?
+            self.publish_all(&publication).await?
         }
         Ok(())
     }
@@ -565,6 +551,23 @@ impl Broker {
             }
             _ => None,
         }
+    }
+
+    async fn publish_all(&mut self, publication: &proto::Publication) -> Result<(), Error> {
+        self.sessions
+            .values_mut()
+            .map(|session| publish_to(session, publication))
+            .collect::<FuturesUnordered<_>>()
+            .fold(Ok(()), |acc, res| {
+                async move {
+                    match (acc, res) {
+                        (Ok(()), Err(e)) => Err(e),
+                        (a, _) => a,
+                    }
+                }
+            })
+            .await?;
+        Ok(())
     }
 }
 

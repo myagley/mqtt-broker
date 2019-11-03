@@ -36,6 +36,10 @@ impl ConnectedSession {
         &self.handle
     }
 
+    pub fn will(&self) -> Option<&proto::Publication> {
+        self.will.as_ref()
+    }
+
     pub fn into_parts(self) -> (SessionState, Option<proto::Publication>, ConnectionHandle) {
         (self.state, self.will, self.handle)
     }
@@ -166,10 +170,6 @@ impl DisconnectingSession {
             will,
             handle,
         }
-    }
-
-    pub fn client_id(&self) -> &ClientId {
-        &self.client_id
     }
 
     pub fn will(&self) -> Option<&proto::Publication> {
@@ -457,6 +457,15 @@ impl Session {
     ) -> Self {
         let disconnecting = DisconnectingSession::new(client_id, will, handle);
         Session::Disconnecting(disconnecting)
+    }
+
+    pub fn will(&self) -> Option<&proto::Publication> {
+        match self {
+            Session::Transient(connected) => connected.will(),
+            Session::Persistent(connected) => connected.will(),
+            Session::Offline(_offline) => None,
+            Session::Disconnecting(disconnecting) => disconnecting.will(),
+        }
     }
 
     pub fn handle_publish(
