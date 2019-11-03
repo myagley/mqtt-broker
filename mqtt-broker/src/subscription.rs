@@ -46,8 +46,39 @@ impl TopicFilter {
         }
     }
 
-    pub fn matches(&self, _topic_name: &str) -> bool {
-        true
+    pub fn matches(&self, topic_name: &str) -> bool {
+        let mut segments = self.segments.iter();
+        let mut levels = topic_name.split(TOPIC_SEPARATOR);
+
+        let mut segment = segments.next();
+        let mut level = levels.next();
+
+        if let Some(Segment::MultiLevelWildcard) = segment {
+            if let Some(l) = level {
+                if l.starts_with("$") {
+                    return false;
+                }
+            }
+        }
+        match (segment, level) {
+            (Some(Segment::MultiLevelWildcard), Some(l)) if l.starts_with("$") => return false,
+            (Some(Segment::SingleLevelWildcard), Some(l)) if l.starts_with("$") => return false,
+            (_, _) => (),
+        }
+
+        while segment.is_some() || level.is_some() {
+            match (segment, level) {
+                (Some(Segment::MultiLevelWildcard), _l) => return true,
+                (Some(s), Some(l)) if !s.matches(l) => return false,
+                (Some(_), Some(_)) => (),
+                (Some(_), None) => return false,
+                (None, _) => return false,
+            }
+
+            segment = segments.next();
+            level = levels.next();
+        }
+        return true;
     }
 }
 
@@ -247,6 +278,33 @@ mod tests {
         fn display_roundtrip(filter in arb_topic_filter()) {
             let string = filter.to_string();
             prop_assert_eq!(filter, string.parse::<TopicFilter>().unwrap());
+        }
+    }
+
+    #[test]
+    fn test_topics() {
+        let cases = vec![
+            ("#", "blah", true),
+            ("blah/#", "blah", true),
+            ("blah/blah2/#", "blah", false),
+            ("blah/+/blah2", "blah/blah1/blah2", true),
+            ("blah/+/blah2", "blah/blah1", false),
+            ("blah/+", "blah/blah1", true),
+            ("blah/blah1", "blah/blah1/blah2", false),
+            ("blah/blah1/blah2", "blah/blah", false),
+            ("#", "$SYS/blah", false),
+            ("+", "$SYS", false),
+        ];
+
+        for (filter, topic, expected) in cases.iter() {
+            let parsed = TopicFilter::from_str(filter).unwrap();
+            assert_eq!(
+                *expected,
+                parsed.matches(topic),
+                "filter \"{}\" matches \"{}\"",
+                filter,
+                topic
+            );
         }
     }
 }
