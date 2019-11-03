@@ -70,6 +70,10 @@ impl ConnReq {
     pub fn into_handle(self) -> ConnectionHandle {
         self.handle
     }
+
+    pub fn into_parts(self) -> (proto::Connect, ConnectionHandle) {
+        (self.connect, self.handle)
+    }
 }
 
 #[derive(Debug)]

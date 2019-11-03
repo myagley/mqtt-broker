@@ -15,12 +15,21 @@ const MAX_INFLIGHT_MESSAGES: usize = 16;
 #[derive(Debug)]
 pub struct ConnectedSession {
     state: SessionState,
+    will: Option<proto::Publication>,
     handle: ConnectionHandle,
 }
 
 impl ConnectedSession {
-    fn new(state: SessionState, handle: ConnectionHandle) -> Self {
-        Self { state, handle }
+    fn new(
+        state: SessionState,
+        will: Option<proto::Publication>,
+        handle: ConnectionHandle,
+    ) -> Self {
+        Self {
+            state,
+            will,
+            handle,
+        }
     }
 
     pub fn handle(&self) -> &ConnectionHandle {
@@ -31,8 +40,8 @@ impl ConnectedSession {
         self.handle
     }
 
-    pub fn into_parts(self) -> (SessionState, ConnectionHandle) {
-        (self.state, self.handle)
+    pub fn into_parts(self) -> (SessionState, Option<proto::Publication>, ConnectionHandle) {
+        (self.state, self.will, self.handle)
     }
 
     pub fn handle_publish(
@@ -391,12 +400,14 @@ pub enum Session {
 impl Session {
     pub fn new_transient(connreq: ConnReq) -> Self {
         let state = SessionState::new(connreq.client_id().clone(), &connreq);
-        let connected = ConnectedSession::new(state, connreq.into_handle());
+        let (connect, handle) = connreq.into_parts();
+        let connected = ConnectedSession::new(state, connect.will, handle);
         Session::Transient(connected)
     }
 
     pub fn new_persistent(connreq: ConnReq, state: SessionState) -> Self {
-        let connected = ConnectedSession::new(state, connreq.into_handle());
+        let (connect, handle) = connreq.into_parts();
+        let connected = ConnectedSession::new(state, connect.will, handle);
         Session::Persistent(connected)
     }
 

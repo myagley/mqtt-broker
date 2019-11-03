@@ -513,7 +513,7 @@ impl Broker {
             );
 
             let client_id = connreq.client_id().clone();
-            let (state, handle) = current_connected.into_parts();
+            let (state, will, handle) = current_connected.into_parts();
             let (new_session, old_session, session_present) =
                 if let proto::ClientId::IdWithExistingSession(_) = connreq.connect().client_id {
                     debug!(
@@ -555,7 +555,7 @@ impl Broker {
                 // to be sent on the connection
 
                 debug!("moving persistent session to offline for {}", client_id);
-                let (state, handle) = connected.into_parts();
+                let (state, will, handle) = connected.into_parts();
                 let new_session = Session::new_offline(state);
                 self.sessions.insert(client_id.clone(), new_session);
                 Some(Session::Disconnecting(client_id.clone(), handle))
