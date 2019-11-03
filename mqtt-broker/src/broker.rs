@@ -824,7 +824,7 @@ mod tests {
 
         // close session and check behavior
         let old_session = broker.close_session(&client_id);
-        assert_matches!(old_session, Some(Session::Disconnecting(_, _)));
+        assert_matches!(old_session, Some(Session::Disconnecting(_)));
         assert_eq!(0, broker.sessions.len());
     }
 
@@ -844,7 +844,7 @@ mod tests {
 
         // close session and check behavior
         let old_session = broker.close_session(&client_id);
-        assert_matches!(old_session, Some(Session::Disconnecting(_, _)));
+        assert_matches!(old_session, Some(Session::Disconnecting(_)));
         assert_eq!(1, broker.sessions.len());
         assert_matches!(broker.sessions[&client_id], Session::Offline(_));
     }
@@ -1000,7 +1000,7 @@ mod tests {
 
         // close session and check behavior
         let old_session = broker.close_session(&client_id);
-        assert_matches!(old_session, Some(Session::Disconnecting(_, _)));
+        assert_matches!(old_session, Some(Session::Disconnecting(_)));
         assert_eq!(1, broker.sessions.len());
         assert_matches!(broker.sessions[&client_id], Session::Offline(_));
 
@@ -1028,7 +1028,7 @@ mod tests {
 
         // close session and check behavior
         let old_session = broker.close_session(&client_id);
-        assert_matches!(old_session, Some(Session::Disconnecting(_, _)));
+        assert_matches!(old_session, Some(Session::Disconnecting(_)));
         assert_eq!(1, broker.sessions.len());
         assert_matches!(broker.sessions[&client_id], Session::Offline(_));
 
