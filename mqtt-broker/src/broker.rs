@@ -188,6 +188,11 @@ impl Broker {
         debug!("handling drop connection...");
         if let Some(mut session) = self.close_session(&client_id) {
             session.send(Event::DropConnection).await?;
+
+            // Ungraceful disconnect - send the will
+            if let Some(ref will) = session.will() {
+                self.publish_all(will).await?;
+            }
         } else {
             debug!("no session for {}", client_id);
         }
@@ -197,8 +202,13 @@ impl Broker {
 
     async fn process_close_session(&mut self, client_id: ClientId) -> Result<(), Error> {
         debug!("handling close session...");
-        if self.close_session(&client_id).is_some() {
+        if let Some(session) = self.close_session(&client_id) {
             debug!("session removed");
+
+            // Ungraceful disconnect - send the will
+            if let Some(ref will) = session.will() {
+                self.publish_all(will).await?;
+            }
         } else {
             debug!("no session for {}", client_id);
         }
@@ -280,19 +290,7 @@ impl Broker {
         };
 
         if let Some(publication) = maybe_publication {
-            self.sessions
-                .values_mut()
-                .map(|session| publish_to(session, &publication))
-                .collect::<FuturesUnordered<_>>()
-                .fold(Ok(()), |acc, res| {
-                    async move {
-                        match (acc, res) {
-                            (Ok(()), Err(e)) => Err(e),
-                            (a, _) => a,
-                        }
-                    }
-                })
-                .await?
+            self.publish_all(&publication).await?
         }
         Ok(())
     }
@@ -379,19 +377,7 @@ impl Broker {
         };
 
         if let Some(publication) = maybe_publication {
-            self.sessions
-                .values_mut()
-                .map(|session| publish_to(session, &publication))
-                .collect::<FuturesUnordered<_>>()
-                .fold(Ok(()), |acc, res| {
-                    async move {
-                        match (acc, res) {
-                            (Ok(()), Err(e)) => Err(e),
-                            (a, _) => a,
-                        }
-                    }
-                })
-                .await?
+            self.publish_all(&publication).await?
         }
         Ok(())
     }
@@ -457,9 +443,9 @@ impl Broker {
 
                 Ok(ack)
             }
-            Some(Session::Disconnecting(client_id, handle)) => Err(
-                SessionError::ProtocolViolation(Session::Disconnecting(client_id, handle)),
-            ),
+            Some(Session::Disconnecting(disconnecting)) => Err(SessionError::ProtocolViolation(
+                Session::Disconnecting(disconnecting),
+            )),
             None => {
                 // No session present - create a new one.
                 let new_session = if let proto::ClientId::IdWithExistingSession(_) =
@@ -513,21 +499,20 @@ impl Broker {
             );
 
             let client_id = connreq.client_id().clone();
-            let (state, handle) = current_connected.into_parts();
-            let (new_session, old_session, session_present) =
+            let (state, _will, handle) = current_connected.into_parts();
+            let old_session = Session::new_disconnecting(client_id.clone(), None, handle);
+            let (new_session, session_present) =
                 if let proto::ClientId::IdWithExistingSession(_) = connreq.connect().client_id {
                     debug!(
                         "moving persistent session to this connection for {}",
                         client_id
                     );
-                    let old_session = Session::Disconnecting(connreq.client_id().clone(), handle);
                     let new_session = Session::new_persistent(connreq, state);
-                    (new_session, old_session, true)
+                    (new_session, true)
                 } else {
                     info!("cleaning session for {}", client_id);
-                    let old_session = Session::Disconnecting(connreq.client_id().clone(), handle);
                     let new_session = Session::new_transient(connreq);
-                    (new_session, old_session, false)
+                    (new_session, false)
                 };
 
             self.sessions.insert(client_id, new_session);
@@ -544,10 +529,8 @@ impl Broker {
         match self.sessions.remove(client_id) {
             Some(Session::Transient(connected)) => {
                 debug!("closing transient session for {}", client_id);
-                Some(Session::Disconnecting(
-                    client_id.clone(),
-                    connected.into_handle(),
-                ))
+                let (_state, will, handle) = connected.into_parts();
+                Some(Session::new_disconnecting(client_id.clone(), will, handle))
             }
             Some(Session::Persistent(connected)) => {
                 // Move a persistent session into the offline state
@@ -555,10 +538,10 @@ impl Broker {
                 // to be sent on the connection
 
                 debug!("moving persistent session to offline for {}", client_id);
-                let (state, handle) = connected.into_parts();
+                let (state, will, handle) = connected.into_parts();
                 let new_session = Session::new_offline(state);
                 self.sessions.insert(client_id.clone(), new_session);
-                Some(Session::Disconnecting(client_id.clone(), handle))
+                Some(Session::new_disconnecting(client_id.clone(), will, handle))
             }
             Some(Session::Offline(offline)) => {
                 debug!("closing already offline session for {}", client_id);
@@ -568,6 +551,23 @@ impl Broker {
             }
             _ => None,
         }
+    }
+
+    async fn publish_all(&mut self, publication: &proto::Publication) -> Result<(), Error> {
+        self.sessions
+            .values_mut()
+            .map(|session| publish_to(session, publication))
+            .collect::<FuturesUnordered<_>>()
+            .fold(Ok(()), |acc, res| {
+                async move {
+                    match (acc, res) {
+                        (Ok(()), Err(e)) => Err(e),
+                        (a, _) => a,
+                    }
+                }
+            })
+            .await?;
+        Ok(())
     }
 }
 
@@ -824,7 +824,7 @@ mod tests {
 
         // close session and check behavior
         let old_session = broker.close_session(&client_id);
-        assert_matches!(old_session, Some(Session::Disconnecting(_, _)));
+        assert_matches!(old_session, Some(Session::Disconnecting(_)));
         assert_eq!(0, broker.sessions.len());
     }
 
@@ -844,7 +844,7 @@ mod tests {
 
         // close session and check behavior
         let old_session = broker.close_session(&client_id);
-        assert_matches!(old_session, Some(Session::Disconnecting(_, _)));
+        assert_matches!(old_session, Some(Session::Disconnecting(_)));
         assert_eq!(1, broker.sessions.len());
         assert_matches!(broker.sessions[&client_id], Session::Offline(_));
     }
@@ -1000,7 +1000,7 @@ mod tests {
 
         // close session and check behavior
         let old_session = broker.close_session(&client_id);
-        assert_matches!(old_session, Some(Session::Disconnecting(_, _)));
+        assert_matches!(old_session, Some(Session::Disconnecting(_)));
         assert_eq!(1, broker.sessions.len());
         assert_matches!(broker.sessions[&client_id], Session::Offline(_));
 
@@ -1028,7 +1028,7 @@ mod tests {
 
         // close session and check behavior
         let old_session = broker.close_session(&client_id);
-        assert_matches!(old_session, Some(Session::Disconnecting(_, _)));
+        assert_matches!(old_session, Some(Session::Disconnecting(_)));
         assert_eq!(1, broker.sessions.len());
         assert_matches!(broker.sessions[&client_id], Session::Offline(_));
 
