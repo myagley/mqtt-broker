@@ -78,7 +78,11 @@ impl ConnectedSession {
         self.state.publish_to(publication)
     }
 
-    pub fn subscribe(&mut self, subscribe: proto::Subscribe) -> Result<proto::SubAck, Error> {
+    pub fn subscribe(
+        &mut self,
+        subscribe: proto::Subscribe,
+    ) -> Result<(proto::SubAck, Vec<Subscription>), Error> {
+        let mut subscriptions = Vec::with_capacity(subscribe.subscribe_to.len());
         let mut acks = Vec::with_capacity(subscribe.subscribe_to.len());
         let packet_identifier = subscribe.packet_identifier;
 
@@ -88,6 +92,7 @@ impl ConnectedSession {
                     let proto::SubscribeTo { topic_filter, qos } = subscribe_to;
 
                     let subscription = Subscription::new(filter, qos);
+                    subscriptions.push(subscription.clone());
                     self.state.update_subscription(topic_filter, subscription);
                     proto::SubAckQos::Success(qos)
                 }
@@ -103,7 +108,7 @@ impl ConnectedSession {
             packet_identifier,
             qos: acks,
         };
-        Ok(suback)
+        Ok((suback, subscriptions))
     }
 
     pub fn unsubscribe(
@@ -596,7 +601,10 @@ impl Session {
         }
     }
 
-    pub fn subscribe(&mut self, subscribe: proto::Subscribe) -> Result<proto::SubAck, Error> {
+    pub fn subscribe(
+        &mut self,
+        subscribe: proto::Subscribe,
+    ) -> Result<(proto::SubAck, Vec<Subscription>), Error> {
         match self {
             Session::Transient(connected) => connected.subscribe(subscribe),
             Session::Persistent(connected) => connected.subscribe(subscribe),

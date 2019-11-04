@@ -10,7 +10,7 @@ const TOPIC_SEPARATOR: char = '/';
 static MULTILEVEL_WILDCARD: &str = "#";
 static SINGLELEVEL_WILDCARD: &str = "+";
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Subscription {
     filter: TopicFilter,
     max_qos: proto::QoS,
@@ -30,7 +30,7 @@ impl Subscription {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct TopicFilter {
     segments: Vec<Segment>,
     multilevel: bool,

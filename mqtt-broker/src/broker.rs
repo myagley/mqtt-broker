@@ -240,11 +240,38 @@ impl Broker {
         client_id: ClientId,
         subscribe: proto::Subscribe,
     ) -> Result<(), Error> {
+        let subscriptions = match self.get_session_mut(&client_id) {
+            Ok(session) => {
+                let (suback, subscriptions) = session.subscribe(subscribe)?;
+                session.send(Event::SubAck(suback)).await?;
+                subscriptions
+            }
+            Err(e) if *e.kind() == ErrorKind::NoSession => {
+                debug!("no session for {}", client_id);
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
+
+        // Handle retained messages
+        let publications = self
+            .retained
+            .values()
+            .filter(|p| {
+                subscriptions
+                    .iter()
+                    .any(|sub| sub.filter().matches(&p.topic_name))
+            })
+            .cloned()
+            .collect::<Vec<proto::Publication>>();
+
         match self.get_session_mut(&client_id) {
             Ok(session) => {
-                // TODO handle retained messages
-                let suback = session.subscribe(subscribe)?;
-                session.send(Event::SubAck(suback)).await
+                for mut publication in publications {
+                    publication.retain = true;
+                    publish_to(session, &publication).await?;
+                }
+                Ok(())
             }
             Err(e) if *e.kind() == ErrorKind::NoSession => {
                 debug!("no session for {}", client_id);
@@ -571,7 +598,7 @@ impl Broker {
             // retained message for that topic
             //
             // We choose to remove it
-            if publication.qos == proto::QoS::AtMostOnce || publication.payload.len() == 0 {
+            if publication.payload.len() == 0 {
                 self.retained.remove(&publication.topic_name);
             } else {
                 self.retained
