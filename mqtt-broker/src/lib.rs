@@ -140,7 +140,11 @@ pub enum ClientEvent {
 }
 
 #[derive(Debug)]
-pub enum SystemEvent {}
+pub enum SystemEvent {
+    // Shutdown,
+// StateSnapshot,
+// ConfigUpdate,
+}
 
 #[derive(Debug)]
 pub enum Message {
