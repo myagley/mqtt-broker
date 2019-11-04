@@ -138,17 +138,15 @@ impl Broker {
         }
 
         // Process the CONNECT packet after it has been validated
-
+        // TODO - fix ConnAck return_code != accepted to not add session to sessions map
         match self.open_session(connreq) {
-            Ok(ack) => {
-                let should_drop = ack.return_code != proto::ConnectReturnCode::Accepted;
-
+            Ok((ack, events)) => {
                 // Send ConnAck on new session
                 let session = self.get_session_mut(&client_id)?;
                 session.send(Event::ConnAck(ack)).await?;
 
-                if should_drop {
-                    session.send(Event::DropConnection).await?;
+                for event in events.into_iter() {
+                    session.send(event).await?;
                 }
             }
             Err(SessionError::DuplicateSession(mut old_session, ack)) => {
@@ -166,6 +164,9 @@ impl Broker {
             }
             Err(SessionError::ProtocolViolation(mut old_session)) => {
                 old_session.send(Event::DropConnection).await?
+            }
+            Err(SessionError::PacketIdentifiersExhausted) => {
+                panic!("Session identifiers exhausted, this can only be caused by a bug.");
             }
         }
 
@@ -408,7 +409,10 @@ impl Broker {
             .ok_or(Error::new(ErrorKind::NoSession.into()))
     }
 
-    fn open_session(&mut self, connreq: ConnReq) -> Result<proto::ConnAck, SessionError> {
+    fn open_session(
+        &mut self,
+        connreq: ConnReq,
+    ) -> Result<(proto::ConnAck, Vec<Event>), SessionError> {
         let client_id = connreq.client_id().clone();
 
         match self.sessions.remove(&client_id) {
@@ -421,18 +425,19 @@ impl Broker {
             Some(Session::Offline(offline)) => {
                 debug!("found an offline session for {}", client_id);
 
-                let (new_session, session_present) = if let proto::ClientId::IdWithExistingSession(
-                    _,
-                ) = connreq.connect().client_id
-                {
-                    debug!("moving offline session to online for {}", client_id);
-                    let new_session = Session::new_persistent(connreq, offline.into_state());
-                    (new_session, true)
-                } else {
-                    info!("cleaning offline session for {}", client_id);
-                    let new_session = Session::new_transient(connreq);
-                    (new_session, false)
-                };
+                let (new_session, events, session_present) =
+                    if let proto::ClientId::IdWithExistingSession(_) = connreq.connect().client_id {
+                        debug!("moving offline session to online for {}", client_id);
+                        let (state, events) = offline
+                            .to_online()
+                            .map_err(|_e| SessionError::PacketIdentifiersExhausted)?;
+                        let new_session = Session::new_persistent(connreq, state);
+                        (new_session, events, true)
+                    } else {
+                        info!("cleaning offline session for {}", client_id);
+                        let new_session = Session::new_transient(connreq);
+                        (new_session, vec![], false)
+                    };
 
                 self.sessions.insert(client_id, new_session);
 
@@ -441,7 +446,7 @@ impl Broker {
                     return_code: proto::ConnectReturnCode::Accepted,
                 };
 
-                Ok(ack)
+                Ok((ack, events))
             }
             Some(Session::Disconnecting(disconnecting)) => Err(SessionError::ProtocolViolation(
                 Session::Disconnecting(disconnecting),
@@ -465,8 +470,9 @@ impl Broker {
                     session_present: false,
                     return_code: proto::ConnectReturnCode::Accepted,
                 };
+                let events = vec![];
 
-                Ok(ack)
+                Ok((ack, events))
             }
         }
     }
@@ -475,7 +481,7 @@ impl Broker {
         &mut self,
         connreq: ConnReq,
         current_connected: ConnectedSession,
-    ) -> Result<proto::ConnAck, SessionError> {
+    ) -> Result<(proto::ConnAck, Vec<Event>), SessionError> {
         if current_connected.handle() == connreq.handle() {
             // [MQTT-3.1.0-2] - The Server MUST process a second CONNECT Packet
             // sent from a Client as a protocol violation and disconnect the Client.
@@ -599,6 +605,7 @@ impl BrokerHandle {
 
 #[derive(Debug)]
 pub enum SessionError {
+    PacketIdentifiersExhausted,
     ProtocolViolation(Session),
     DuplicateSession(Session, proto::ConnAck),
 }

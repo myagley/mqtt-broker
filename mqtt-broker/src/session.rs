@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 use std::{cmp, fmt, mem};
 
@@ -147,8 +147,63 @@ impl OfflineSession {
         Ok(None)
     }
 
-    pub fn into_state(self) -> SessionState {
-        self.state
+    pub fn to_online(self) -> Result<(SessionState, Vec<Event>), Error> {
+        let mut events = Vec::with_capacity(MAX_INFLIGHT_MESSAGES);
+        let OfflineSession { mut state } = self;
+
+        // Handle the outstanding QoS 1 and QoS 2 packets
+        for (id, publish) in state.waiting_to_be_acked.iter() {
+            let to_publish = match publish {
+                Publish::QoS12(id, p) => {
+                    let pidq = match p.packet_identifier_dup_qos {
+                        proto::PacketIdentifierDupQoS::AtLeastOnce(id, _) => {
+                            proto::PacketIdentifierDupQoS::AtLeastOnce(id, true)
+                        }
+                        proto::PacketIdentifierDupQoS::ExactlyOnce(id, _) => {
+                            proto::PacketIdentifierDupQoS::ExactlyOnce(id, true)
+                        }
+                        proto::PacketIdentifierDupQoS::AtMostOnce => {
+                            proto::PacketIdentifierDupQoS::AtMostOnce
+                        }
+                    };
+
+                    let mut p1 = p.clone();
+                    p1.packet_identifier_dup_qos = pidq;
+                    Publish::QoS12(*id, p1)
+                }
+                _ => publish.clone(),
+            };
+
+            debug!("resending QoS12 packet {}", id);
+            events.push(Event::PublishTo(to_publish));
+        }
+
+        // Handle the outstanding QoS 0 packets
+        for (id, publish) in state.waiting_to_be_acked_qos0.iter() {
+            debug!("resending QoS0 packet {}", id);
+            events.push(Event::PublishTo(publish.clone()));
+        }
+
+        // Handle the outstanding QoS 2 packets in the second stage of transmission
+        for completed in state.waiting_to_be_completed.iter() {
+            events.push(Event::PubRel(proto::PubRel {
+                packet_identifier: *completed,
+            }));
+        }
+
+        // Dequeue any queued messages - up to the max inflight count
+        while state.allowed_to_send() {
+            match state.waiting_to_be_sent.pop_front() {
+                Some(publication) => {
+                    debug!("dequeueing a message for {}", state.client_id);
+                    let event = state.prepare_to_send(publication)?;
+                    events.push(event);
+                }
+                None => break,
+            }
+        }
+
+        Ok((state, events))
     }
 }
 
@@ -196,10 +251,14 @@ pub struct SessionState {
     packet_identifiers_qos0: PacketIdentifiers,
 
     waiting_to_be_sent: VecDeque<proto::Publication>,
-    waiting_to_be_acked: BTreeMap<proto::PacketIdentifier, Publish>,
-    waiting_to_be_acked_qos0: BTreeMap<proto::PacketIdentifier, Publish>,
-    waiting_to_be_released: BTreeMap<proto::PacketIdentifier, proto::Publish>,
-    waiting_to_be_completed: BTreeSet<proto::PacketIdentifier>,
+
+    // for incoming messages - QoS2
+    waiting_to_be_released: HashMap<proto::PacketIdentifier, proto::Publish>,
+
+    // for outgoing messages - all QoS
+    waiting_to_be_acked: HashMap<proto::PacketIdentifier, Publish>,
+    waiting_to_be_acked_qos0: HashMap<proto::PacketIdentifier, Publish>,
+    waiting_to_be_completed: HashSet<proto::PacketIdentifier>,
 }
 
 impl SessionState {
@@ -213,10 +272,10 @@ impl SessionState {
             packet_identifiers_qos0: PacketIdentifiers::default(),
 
             waiting_to_be_sent: VecDeque::new(),
-            waiting_to_be_acked: BTreeMap::new(),
-            waiting_to_be_acked_qos0: BTreeMap::new(),
-            waiting_to_be_released: BTreeMap::new(),
-            waiting_to_be_completed: BTreeSet::new(),
+            waiting_to_be_acked: HashMap::new(),
+            waiting_to_be_acked_qos0: HashMap::new(),
+            waiting_to_be_released: HashMap::new(),
+            waiting_to_be_completed: HashSet::new(),
         }
     }
 

@@ -76,7 +76,7 @@ impl ConnReq {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum Publish {
     QoS0(proto::PacketIdentifier, proto::Publish),
     QoS12(proto::PacketIdentifier, proto::Publish),
