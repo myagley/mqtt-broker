@@ -11,7 +11,7 @@ failure = "0.1"
 futures-util-preview = "0.3.0-alpha.19"
 lazy_static = "1"
 tokio = "0.2.0-alpha.6"
-tokio-io-timeout = { git = "https://github.com/myagley/tokio-io-timeout", branch = "miyagley/new-tokio" }
+tokio-io-timeout = "0.4.0-alpha.2"
 tokio-net = "0.2.0-alpha.6"
 tracing = "0.1"
 tracing-futures = { git = "https://github.com/tokio-rs/tracing", tag="tracing-0.1.10", default-features = false, features = ["std-future"] }
