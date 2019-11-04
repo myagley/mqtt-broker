@@ -26,6 +26,7 @@ pub struct Broker {
     sender: Sender<Message>,
     messages: Receiver<Message>,
     sessions: HashMap<ClientId, Session>,
+    retained: HashMap<String, proto::Publication>,
 }
 
 impl Broker {
@@ -35,6 +36,7 @@ impl Broker {
             sender,
             messages,
             sessions: HashMap::new(),
+            retained: HashMap::new(),
         }
     }
 
@@ -191,7 +193,7 @@ impl Broker {
             session.send(Event::DropConnection).await?;
 
             // Ungraceful disconnect - send the will
-            if let Some(ref will) = session.will() {
+            if let Some(will) = session.into_will() {
                 self.publish_all(will).await?;
             }
         } else {
@@ -207,7 +209,7 @@ impl Broker {
             debug!("session removed");
 
             // Ungraceful disconnect - send the will
-            if let Some(ref will) = session.will() {
+            if let Some(will) = session.into_will() {
                 self.publish_all(will).await?;
             }
         } else {
@@ -238,11 +240,38 @@ impl Broker {
         client_id: ClientId,
         subscribe: proto::Subscribe,
     ) -> Result<(), Error> {
+        let subscriptions = match self.get_session_mut(&client_id) {
+            Ok(session) => {
+                let (suback, subscriptions) = session.subscribe(subscribe)?;
+                session.send(Event::SubAck(suback)).await?;
+                subscriptions
+            }
+            Err(e) if *e.kind() == ErrorKind::NoSession => {
+                debug!("no session for {}", client_id);
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
+
+        // Handle retained messages
+        let publications = self
+            .retained
+            .values()
+            .filter(|p| {
+                subscriptions
+                    .iter()
+                    .any(|sub| sub.filter().matches(&p.topic_name))
+            })
+            .cloned()
+            .collect::<Vec<proto::Publication>>();
+
         match self.get_session_mut(&client_id) {
             Ok(session) => {
-                // TODO handle retained messages
-                let suback = session.subscribe(subscribe)?;
-                session.send(Event::SubAck(suback)).await
+                for mut publication in publications {
+                    publication.retain = true;
+                    publish_to(session, &publication).await?;
+                }
+                Ok(())
             }
             Err(e) if *e.kind() == ErrorKind::NoSession => {
                 debug!("no session for {}", client_id);
@@ -291,7 +320,7 @@ impl Broker {
         };
 
         if let Some(publication) = maybe_publication {
-            self.publish_all(&publication).await?
+            self.publish_all(publication).await?
         }
         Ok(())
     }
@@ -378,7 +407,7 @@ impl Broker {
         };
 
         if let Some(publication) = maybe_publication {
-            self.publish_all(&publication).await?
+            self.publish_all(publication).await?
         }
         Ok(())
     }
@@ -559,10 +588,44 @@ impl Broker {
         }
     }
 
-    async fn publish_all(&mut self, publication: &proto::Publication) -> Result<(), Error> {
+    async fn publish_all(&mut self, mut publication: proto::Publication) -> Result<(), Error> {
+        if publication.retain {
+            // [MQTT-3.3.1-6]. If the Server receives a QoS 0 message with the
+            // RETAIN flag set to 1 it MUST discard any message previously
+            // retained for that topic. It SHOULD store the new QoS 0 message
+            // as the new retained message for that topic, but MAY choose to
+            // discard it at any time - if this happens there will be no
+            // retained message for that topic
+            //
+            // We choose to keep it
+            if publication.payload.len() == 0 {
+                info!(
+                    "removing retained message for topic \"{}\"",
+                    publication.topic_name
+                );
+                self.retained.remove(&publication.topic_name);
+            } else {
+                let maybe_retained = self
+                    .retained
+                    .insert(publication.topic_name.to_owned(), publication.clone());
+                if maybe_retained.is_none() {
+                    info!(
+                        "new retained message for topic \"{}\"",
+                        publication.topic_name
+                    );
+                }
+            }
+        }
+
+        // Set the retain to false. This should only be set true
+        // when sending due to a new subscription.
+        //
+        // This will not happen here.
+        publication.retain = false;
+
         self.sessions
             .values_mut()
-            .map(|session| publish_to(session, publication))
+            .map(|session| publish_to(session, &publication))
             .collect::<FuturesUnordered<_>>()
             .fold(Ok(()), |acc, res| {
                 async move {

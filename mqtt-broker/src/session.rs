@@ -36,8 +36,8 @@ impl ConnectedSession {
         &self.handle
     }
 
-    pub fn will(&self) -> Option<&proto::Publication> {
-        self.will.as_ref()
+    pub fn into_will(self) -> Option<proto::Publication> {
+        self.will
     }
 
     pub fn into_parts(self) -> (SessionState, Option<proto::Publication>, ConnectionHandle) {
@@ -78,7 +78,11 @@ impl ConnectedSession {
         self.state.publish_to(publication)
     }
 
-    pub fn subscribe(&mut self, subscribe: proto::Subscribe) -> Result<proto::SubAck, Error> {
+    pub fn subscribe(
+        &mut self,
+        subscribe: proto::Subscribe,
+    ) -> Result<(proto::SubAck, Vec<Subscription>), Error> {
+        let mut subscriptions = Vec::with_capacity(subscribe.subscribe_to.len());
         let mut acks = Vec::with_capacity(subscribe.subscribe_to.len());
         let packet_identifier = subscribe.packet_identifier;
 
@@ -88,6 +92,7 @@ impl ConnectedSession {
                     let proto::SubscribeTo { topic_filter, qos } = subscribe_to;
 
                     let subscription = Subscription::new(filter, qos);
+                    subscriptions.push(subscription.clone());
                     self.state.update_subscription(topic_filter, subscription);
                     proto::SubAckQos::Success(qos)
                 }
@@ -103,7 +108,7 @@ impl ConnectedSession {
             packet_identifier,
             qos: acks,
         };
-        Ok(suback)
+        Ok((suback, subscriptions))
     }
 
     pub fn unsubscribe(
@@ -227,8 +232,8 @@ impl DisconnectingSession {
         }
     }
 
-    pub fn will(&self) -> Option<&proto::Publication> {
-        self.will.as_ref()
+    pub fn into_will(self) -> Option<proto::Publication> {
+        self.will
     }
 
     async fn send(&mut self, event: Event) -> Result<(), Error> {
@@ -323,7 +328,7 @@ impl SessionState {
                 let publication = proto::Publication {
                     topic_name: publish.topic_name,
                     qos: proto::QoS::AtMostOnce,
-                    retain: false,
+                    retain: publish.retain,
                     payload: publish.payload,
                 };
                 (Some(publication), None)
@@ -332,7 +337,7 @@ impl SessionState {
                 let publication = proto::Publication {
                     topic_name: publish.topic_name,
                     qos: proto::QoS::AtLeastOnce,
-                    retain: false,
+                    retain: publish.retain,
                     payload: publish.payload,
                 };
                 let puback = proto::PubAck { packet_identifier };
@@ -370,7 +375,7 @@ impl SessionState {
             .map(|publish| proto::Publication {
                 topic_name: publish.topic_name,
                 qos: proto::QoS::ExactlyOnce,
-                retain: false,
+                retain: publish.retain,
                 payload: publish.payload,
             });
         Ok(publication)
@@ -434,7 +439,7 @@ impl SessionState {
                 let id = self.packet_identifiers_qos0.reserve()?;
                 let packet = proto::Publish {
                     packet_identifier_dup_qos: proto::PacketIdentifierDupQoS::AtMostOnce,
-                    retain: false,
+                    retain: publication.retain,
                     topic_name: publication.topic_name.to_owned(),
                     payload: publication.payload.to_owned(),
                 };
@@ -446,7 +451,7 @@ impl SessionState {
                     packet_identifier_dup_qos: proto::PacketIdentifierDupQoS::AtLeastOnce(
                         id, false,
                     ),
-                    retain: false,
+                    retain: publication.retain,
                     topic_name: publication.topic_name.to_owned(),
                     payload: publication.payload.to_owned(),
                 };
@@ -458,7 +463,7 @@ impl SessionState {
                     packet_identifier_dup_qos: proto::PacketIdentifierDupQoS::ExactlyOnce(
                         id, false,
                     ),
-                    retain: false,
+                    retain: publication.retain,
                     topic_name: publication.topic_name.to_owned(),
                     payload: publication.payload.to_owned(),
                 };
@@ -518,12 +523,12 @@ impl Session {
         Session::Disconnecting(disconnecting)
     }
 
-    pub fn will(&self) -> Option<&proto::Publication> {
+    pub fn into_will(self) -> Option<proto::Publication> {
         match self {
-            Session::Transient(connected) => connected.will(),
-            Session::Persistent(connected) => connected.will(),
+            Session::Transient(connected) => connected.into_will(),
+            Session::Persistent(connected) => connected.into_will(),
             Session::Offline(_offline) => None,
-            Session::Disconnecting(disconnecting) => disconnecting.will(),
+            Session::Disconnecting(disconnecting) => disconnecting.into_will(),
         }
     }
 
@@ -596,7 +601,10 @@ impl Session {
         }
     }
 
-    pub fn subscribe(&mut self, subscribe: proto::Subscribe) -> Result<proto::SubAck, Error> {
+    pub fn subscribe(
+        &mut self,
+        subscribe: proto::Subscribe,
+    ) -> Result<(proto::SubAck, Vec<Subscription>), Error> {
         match self {
             Session::Transient(connected) => connected.subscribe(subscribe),
             Session::Persistent(connected) => connected.subscribe(subscribe),
