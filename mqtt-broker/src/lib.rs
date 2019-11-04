@@ -83,7 +83,7 @@ pub enum Publish {
 }
 
 #[derive(Debug)]
-pub enum Event {
+pub enum ClientEvent {
     /// Connect request
     ConnReq(ConnReq),
 
@@ -140,31 +140,16 @@ pub enum Event {
 }
 
 #[derive(Debug)]
-pub struct Message {
-    client_id: ClientId,
-    event: Event,
+pub enum SystemEvent {
+    // Shutdown,
+// StateSnapshot,
+// ConfigUpdate,
 }
 
-impl Message {
-    pub fn new(client_id: ClientId, event: Event) -> Self {
-        Self { client_id, event }
-    }
-
-    pub fn client_id(&self) -> &ClientId {
-        &self.client_id
-    }
-
-    pub fn event(&self) -> &Event {
-        &self.event
-    }
-
-    pub fn into_event(self) -> Event {
-        self.event
-    }
-
-    pub fn into_parts(self) -> (ClientId, Event) {
-        (self.client_id, self.event)
-    }
+#[derive(Debug)]
+pub enum Message {
+    Client(ClientId, ClientEvent),
+    System(SystemEvent),
 }
 
 #[cfg(test)]

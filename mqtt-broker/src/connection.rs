@@ -18,7 +18,7 @@ use tracing_futures::Instrument;
 use uuid::Uuid;
 
 use crate::broker::BrokerHandle;
-use crate::{ClientId, ConnReq, Error, ErrorKind, Event, Message, Publish};
+use crate::{ClientEvent, ClientId, ConnReq, Error, ErrorKind, Message, Publish};
 
 lazy_static! {
     static ref DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -118,8 +118,8 @@ where
                 let (outgoing, incoming) = codec.split();
 
                 let req = ConnReq::new(client_id.clone(), connect, connection_handle);
-                let event = Event::ConnReq(req);
-                let message = Message::new(client_id.clone(), event);
+                let event = ClientEvent::ConnReq(req);
+                let message = Message::Client(client_id.clone(), event);
                 broker_handle.send(message).await?;
 
                 // Start up the processing tasks
@@ -147,7 +147,7 @@ where
                         // send a DropConnection request to the broker and wait for the outgoing
                         // task to drain
                         debug!(message = "incoming_task finished with an error. sending drop connection request to broker", error=%e);
-                        let msg = Message::new(client_id.clone(), Event::DropConnection);
+                        let msg = Message::Client(client_id.clone(), ClientEvent::DropConnection);
                         broker_handle.send(msg).await?;
 
                         debug!("waiting for outgoing_task to complete...");
@@ -173,7 +173,7 @@ where
                         drop(inc);
 
                         debug!(message = "outgoing_task finished with an error. notifying the broker to remove the connection", %e);
-                        let msg = Message::new(client_id.clone(), Event::CloseSession);
+                        let msg = Message::Client(client_id.clone(), ClientEvent::CloseSession);
                         broker_handle.send(msg).await?;
 
                         debug!("draining message receiver for connection...");
@@ -216,28 +216,28 @@ where
                         warn!("CONNECT packet received on an already established connection, dropping connection due to protocol violation");
                         return Err(Error::from(ErrorKind::ProtocolViolation));
                     }
-                    Packet::ConnAck(connack) => Event::ConnAck(connack),
+                    Packet::ConnAck(connack) => ClientEvent::ConnAck(connack),
                     Packet::Disconnect(disconnect) => {
-                        let event = Event::Disconnect(disconnect);
-                        let message = Message::new(client_id.clone(), event);
+                        let event = ClientEvent::Disconnect(disconnect);
+                        let message = Message::Client(client_id.clone(), event);
                         broker.send(message).await?;
                         debug!("disconnect received. shutting down receive side of connection");
                         return Ok(());
                     }
-                    Packet::PingReq(ping) => Event::PingReq(ping),
-                    Packet::PingResp(pingresp) => Event::PingResp(pingresp),
-                    Packet::PubAck(puback) => Event::PubAck(puback),
-                    Packet::PubComp(pubcomp) => Event::PubComp(pubcomp),
-                    Packet::Publish(publish) => Event::PublishFrom(publish),
-                    Packet::PubRec(pubrec) => Event::PubRec(pubrec),
-                    Packet::PubRel(pubrel) => Event::PubRel(pubrel),
-                    Packet::Subscribe(subscribe) => Event::Subscribe(subscribe),
-                    Packet::SubAck(suback) => Event::SubAck(suback),
-                    Packet::Unsubscribe(unsubscribe) => Event::Unsubscribe(unsubscribe),
-                    Packet::UnsubAck(unsuback) => Event::UnsubAck(unsuback),
+                    Packet::PingReq(ping) => ClientEvent::PingReq(ping),
+                    Packet::PingResp(pingresp) => ClientEvent::PingResp(pingresp),
+                    Packet::PubAck(puback) => ClientEvent::PubAck(puback),
+                    Packet::PubComp(pubcomp) => ClientEvent::PubComp(pubcomp),
+                    Packet::Publish(publish) => ClientEvent::PublishFrom(publish),
+                    Packet::PubRec(pubrec) => ClientEvent::PubRec(pubrec),
+                    Packet::PubRel(pubrel) => ClientEvent::PubRel(pubrel),
+                    Packet::Subscribe(subscribe) => ClientEvent::Subscribe(subscribe),
+                    Packet::SubAck(suback) => ClientEvent::SubAck(suback),
+                    Packet::Unsubscribe(unsubscribe) => ClientEvent::Unsubscribe(unsubscribe),
+                    Packet::UnsubAck(unsuback) => ClientEvent::UnsubAck(unsuback),
                 };
 
-                let message = Message::new(client_id.clone(), event);
+                let message = Message::Client(client_id.clone(), event);
                 broker.send(message).await?;
             }
             Err(e) => {
@@ -248,7 +248,7 @@ where
     }
 
     debug!("no more packets. sending DropConnection to broker.");
-    let message = Message::new(client_id.clone(), Event::DropConnection);
+    let message = Message::Client(client_id.clone(), ClientEvent::DropConnection);
     broker.send(message).await?;
     debug!("incoming_task completing...");
     Ok(())
@@ -266,49 +266,54 @@ where
     debug!("outgoing_task start");
     while let Some(message) = messages.recv().await {
         debug!("outgoing: {:?}", message);
-        let maybe_packet = match message.into_event() {
-            Event::ConnReq(_) => None,
-            Event::ConnAck(connack) => Some(Packet::ConnAck(connack)),
-            Event::Disconnect(_) => {
-                debug!("asked to disconnect. outgoing_task completing...");
-                return Ok(());
-            }
-            Event::DropConnection => {
-                debug!("asked to drop connection. outgoing_task completing...");
-                return Ok(());
-            }
-            Event::CloseSession => None,
-            Event::PingReq(req) => Some(Packet::PingReq(req)),
-            Event::PingResp(response) => Some(Packet::PingResp(response)),
-            Event::Subscribe(sub) => Some(Packet::Subscribe(sub)),
-            Event::SubAck(suback) => Some(Packet::SubAck(suback)),
-            Event::Unsubscribe(unsub) => Some(Packet::Unsubscribe(unsub)),
-            Event::UnsubAck(unsuback) => Some(Packet::UnsubAck(unsuback)),
-            Event::PublishFrom(_publish) => None,
-            Event::PublishTo(Publish::QoS12(_id, publish)) => Some(Packet::Publish(publish)),
-            Event::PublishTo(Publish::QoS0(id, publish)) => {
-                let result = outgoing
-                    .send(Packet::Publish(publish))
-                    .await
-                    .context(ErrorKind::EncodePacket);
-
-                if let Err(e) = result {
-                    warn!(message = "error occurred while writing to connection", error=%e);
-                    return Err((messages, e.into()));
-                } else {
-                    let message = Message::new(client_id.clone(), Event::PubAck0(id));
-                    if let Err(e) = broker.send(message).await {
-                        warn!(message = "error occurred while sending QoS ack to broker", error=%e);
-                        return Err((messages, e.into()));
-                    }
+        let maybe_packet = match message {
+            Message::Client(_client_id, event) => match event {
+                ClientEvent::ConnReq(_) => None,
+                ClientEvent::ConnAck(connack) => Some(Packet::ConnAck(connack)),
+                ClientEvent::Disconnect(_) => {
+                    debug!("asked to disconnect. outgoing_task completing...");
+                    return Ok(());
                 }
-                None
-            }
-            Event::PubAck0(_id) => None,
-            Event::PubAck(puback) => Some(Packet::PubAck(puback)),
-            Event::PubRec(pubrec) => Some(Packet::PubRec(pubrec)),
-            Event::PubRel(pubrel) => Some(Packet::PubRel(pubrel)),
-            Event::PubComp(pubcomp) => Some(Packet::PubComp(pubcomp)),
+                ClientEvent::DropConnection => {
+                    debug!("asked to drop connection. outgoing_task completing...");
+                    return Ok(());
+                }
+                ClientEvent::CloseSession => None,
+                ClientEvent::PingReq(req) => Some(Packet::PingReq(req)),
+                ClientEvent::PingResp(response) => Some(Packet::PingResp(response)),
+                ClientEvent::Subscribe(sub) => Some(Packet::Subscribe(sub)),
+                ClientEvent::SubAck(suback) => Some(Packet::SubAck(suback)),
+                ClientEvent::Unsubscribe(unsub) => Some(Packet::Unsubscribe(unsub)),
+                ClientEvent::UnsubAck(unsuback) => Some(Packet::UnsubAck(unsuback)),
+                ClientEvent::PublishFrom(_publish) => None,
+                ClientEvent::PublishTo(Publish::QoS12(_id, publish)) => {
+                    Some(Packet::Publish(publish))
+                }
+                ClientEvent::PublishTo(Publish::QoS0(id, publish)) => {
+                    let result = outgoing
+                        .send(Packet::Publish(publish))
+                        .await
+                        .context(ErrorKind::EncodePacket);
+
+                    if let Err(e) = result {
+                        warn!(message = "error occurred while writing to connection", error=%e);
+                        return Err((messages, e.into()));
+                    } else {
+                        let message = Message::Client(client_id.clone(), ClientEvent::PubAck0(id));
+                        if let Err(e) = broker.send(message).await {
+                            warn!(message = "error occurred while sending QoS ack to broker", error=%e);
+                            return Err((messages, e.into()));
+                        }
+                    }
+                    None
+                }
+                ClientEvent::PubAck0(_id) => None,
+                ClientEvent::PubAck(puback) => Some(Packet::PubAck(puback)),
+                ClientEvent::PubRec(pubrec) => Some(Packet::PubRec(pubrec)),
+                ClientEvent::PubRel(pubrel) => Some(Packet::PubRel(pubrel)),
+                ClientEvent::PubComp(pubcomp) => Some(Packet::PubComp(pubcomp)),
+            },
+            Message::System(_event) => None,
         };
 
         if let Some(packet) = maybe_packet {

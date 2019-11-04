@@ -9,7 +9,7 @@ use tracing::{debug, info, span, warn, Level};
 use tracing_futures::Instrument;
 
 use crate::session::{ConnectedSession, Session, SessionState};
-use crate::{ClientId, ConnReq, Error, ErrorKind, Event, Message};
+use crate::{ClientEvent, ClientId, ConnReq, Error, ErrorKind, Message};
 
 static EXPECTED_PROTOCOL_NAME: &str = "MQTT";
 const EXPECTED_PROTOCOL_LEVEL: u8 = 0x4;
@@ -46,38 +46,50 @@ impl Broker {
 
     pub async fn run(mut self) {
         while let Some(message) = self.messages.recv().await {
-            let span = span!(Level::INFO, "broker", client_id=%message.client_id());
-            if let Err(e) = self.process_message(message).instrument(span).await {
-                warn!(message = "an error occurred processing a message", error=%e);
+            match message {
+                Message::Client(client_id, event) => {
+                    let span = span!(Level::INFO, "broker", client_id=%client_id);
+                    if let Err(e) = self
+                        .process_message(client_id, event)
+                        .instrument(span)
+                        .await
+                    {
+                        warn!(message = "an error occurred processing a message", error=%e);
+                    }
+                }
+                Message::System(_event) => (),
             }
         }
         info!("broker task exiting");
     }
 
-    async fn process_message(&mut self, message: Message) -> Result<(), Error> {
-        let (client_id, event) = message.into_parts();
+    async fn process_message(
+        &mut self,
+        client_id: ClientId,
+        event: ClientEvent,
+    ) -> Result<(), Error> {
         debug!("incoming: {:?}", event);
         let result = match event {
-            Event::ConnReq(connreq) => self.process_connect(client_id, connreq).await,
-            Event::ConnAck(_) => Ok(info!("broker received CONNACK, ignoring")),
-            Event::Disconnect(_) => self.process_disconnect(client_id).await,
-            Event::DropConnection => self.process_drop_connection(client_id).await,
-            Event::CloseSession => self.process_close_session(client_id).await,
-            Event::PingReq(ping) => self.process_ping_req(client_id, ping).await,
-            Event::PingResp(_) => Ok(info!("broker received PINGRESP, ignoring")),
-            Event::Subscribe(subscribe) => self.process_subscribe(client_id, subscribe).await,
-            Event::SubAck(_) => Ok(info!("broker received SUBACK, ignoring")),
-            Event::Unsubscribe(unsubscribe) => {
+            ClientEvent::ConnReq(connreq) => self.process_connect(client_id, connreq).await,
+            ClientEvent::ConnAck(_) => Ok(info!("broker received CONNACK, ignoring")),
+            ClientEvent::Disconnect(_) => self.process_disconnect(client_id).await,
+            ClientEvent::DropConnection => self.process_drop_connection(client_id).await,
+            ClientEvent::CloseSession => self.process_close_session(client_id).await,
+            ClientEvent::PingReq(ping) => self.process_ping_req(client_id, ping).await,
+            ClientEvent::PingResp(_) => Ok(info!("broker received PINGRESP, ignoring")),
+            ClientEvent::Subscribe(subscribe) => self.process_subscribe(client_id, subscribe).await,
+            ClientEvent::SubAck(_) => Ok(info!("broker received SUBACK, ignoring")),
+            ClientEvent::Unsubscribe(unsubscribe) => {
                 self.process_unsubscribe(client_id, unsubscribe).await
             }
-            Event::UnsubAck(_) => Ok(info!("broker received UNSUBACK, ignoring")),
-            Event::PublishFrom(publish) => self.process_publish(client_id, publish).await,
-            Event::PublishTo(_publish) => Ok(info!("broker received a PublishTo, ignoring")),
-            Event::PubAck0(id) => self.process_puback0(client_id, id).await,
-            Event::PubAck(puback) => self.process_puback(client_id, puback).await,
-            Event::PubRec(pubrec) => self.process_pubrec(client_id, pubrec).await,
-            Event::PubRel(pubrel) => self.process_pubrel(client_id, pubrel).await,
-            Event::PubComp(pubcomp) => self.process_pubcomp(client_id, pubcomp).await,
+            ClientEvent::UnsubAck(_) => Ok(info!("broker received UNSUBACK, ignoring")),
+            ClientEvent::PublishFrom(publish) => self.process_publish(client_id, publish).await,
+            ClientEvent::PublishTo(_publish) => Ok(info!("broker received a PublishTo, ignoring")),
+            ClientEvent::PubAck0(id) => self.process_puback0(client_id, id).await,
+            ClientEvent::PubAck(puback) => self.process_puback(client_id, puback).await,
+            ClientEvent::PubRec(pubrec) => self.process_pubrec(client_id, pubrec).await,
+            ClientEvent::PubRel(pubrel) => self.process_pubrel(client_id, pubrel).await,
+            ClientEvent::PubComp(pubcomp) => self.process_pubcomp(client_id, pubcomp).await,
         };
 
         if let Err(e) = result {
@@ -107,7 +119,7 @@ impl Broker {
                 connreq.connect().protocol_name
             );
             debug!("dropping connection due to invalid protocol name");
-            let message = Message::new(client_id, Event::DropConnection);
+            let message = Message::Client(client_id, ClientEvent::DropConnection);
             try_send!(connreq.handle_mut(), message);
             return Ok(());
         }
@@ -129,12 +141,12 @@ impl Broker {
             };
 
             debug!("sending connack...");
-            let event = Event::ConnAck(ack);
-            let message = Message::new(client_id.clone(), event);
+            let event = ClientEvent::ConnAck(ack);
+            let message = Message::Client(client_id.clone(), event);
             try_send!(connreq.handle_mut(), message);
 
             debug!("dropping connection due to invalid protocol level");
-            let message = Message::new(client_id, Event::DropConnection);
+            let message = Message::Client(client_id, ClientEvent::DropConnection);
             try_send!(connreq.handle_mut(), message);
             return Ok(());
         }
@@ -145,7 +157,7 @@ impl Broker {
             Ok((ack, events)) => {
                 // Send ConnAck on new session
                 let session = self.get_session_mut(&client_id)?;
-                session.send(Event::ConnAck(ack)).await?;
+                session.send(ClientEvent::ConnAck(ack)).await?;
 
                 for event in events.into_iter() {
                     session.send(event).await?;
@@ -153,19 +165,19 @@ impl Broker {
             }
             Err(SessionError::DuplicateSession(mut old_session, ack)) => {
                 // Drop the old connection
-                old_session.send(Event::DropConnection).await?;
+                old_session.send(ClientEvent::DropConnection).await?;
 
                 // Send ConnAck on new connection
                 let should_drop = ack.return_code != proto::ConnectReturnCode::Accepted;
                 let session = self.get_session_mut(&client_id)?;
-                session.send(Event::ConnAck(ack)).await?;
+                session.send(ClientEvent::ConnAck(ack)).await?;
 
                 if should_drop {
-                    session.send(Event::DropConnection).await?;
+                    session.send(ClientEvent::DropConnection).await?;
                 }
             }
             Err(SessionError::ProtocolViolation(mut old_session)) => {
-                old_session.send(Event::DropConnection).await?
+                old_session.send(ClientEvent::DropConnection).await?
             }
             Err(SessionError::PacketIdentifiersExhausted) => {
                 panic!("Session identifiers exhausted, this can only be caused by a bug.");
@@ -179,7 +191,9 @@ impl Broker {
     async fn process_disconnect(&mut self, client_id: ClientId) -> Result<(), Error> {
         debug!("handling disconnect...");
         if let Some(mut session) = self.close_session(&client_id) {
-            session.send(Event::Disconnect(proto::Disconnect)).await?;
+            session
+                .send(ClientEvent::Disconnect(proto::Disconnect))
+                .await?;
         } else {
             debug!("no session for {}", client_id);
         }
@@ -190,7 +204,7 @@ impl Broker {
     async fn process_drop_connection(&mut self, client_id: ClientId) -> Result<(), Error> {
         debug!("handling drop connection...");
         if let Some(mut session) = self.close_session(&client_id) {
-            session.send(Event::DropConnection).await?;
+            session.send(ClientEvent::DropConnection).await?;
 
             // Ungraceful disconnect - send the will
             if let Some(will) = session.into_will() {
@@ -226,7 +240,7 @@ impl Broker {
     ) -> Result<(), Error> {
         debug!("handling ping request...");
         match self.get_session_mut(&client_id) {
-            Ok(session) => session.send(Event::PingResp(proto::PingResp)).await,
+            Ok(session) => session.send(ClientEvent::PingResp(proto::PingResp)).await,
             Err(e) if *e.kind() == ErrorKind::NoSession => {
                 debug!("no session for {}", client_id);
                 Ok(())
@@ -243,7 +257,7 @@ impl Broker {
         let subscriptions = match self.get_session_mut(&client_id) {
             Ok(session) => {
                 let (suback, subscriptions) = session.subscribe(subscribe)?;
-                session.send(Event::SubAck(suback)).await?;
+                session.send(ClientEvent::SubAck(suback)).await?;
                 subscriptions
             }
             Err(e) if *e.kind() == ErrorKind::NoSession => {
@@ -289,7 +303,7 @@ impl Broker {
         match self.get_session_mut(&client_id) {
             Ok(session) => {
                 let unsuback = session.unsubscribe(unsubscribe)?;
-                session.send(Event::UnsubAck(unsuback)).await
+                session.send(ClientEvent::UnsubAck(unsuback)).await
             }
             Err(e) if *e.kind() == ErrorKind::NoSession => {
                 debug!("no session for {}", client_id);
@@ -396,7 +410,7 @@ impl Broker {
                 let maybe_publication = session.handle_pubrel(pubrel)?;
 
                 let pubcomp = proto::PubComp { packet_identifier };
-                session.send(Event::PubComp(pubcomp)).await?;
+                session.send(ClientEvent::PubComp(pubcomp)).await?;
                 maybe_publication
             }
             Err(e) if *e.kind() == ErrorKind::NoSession => {
@@ -441,7 +455,7 @@ impl Broker {
     fn open_session(
         &mut self,
         connreq: ConnReq,
-    ) -> Result<(proto::ConnAck, Vec<Event>), SessionError> {
+    ) -> Result<(proto::ConnAck, Vec<ClientEvent>), SessionError> {
         let client_id = connreq.client_id().clone();
 
         match self.sessions.remove(&client_id) {
@@ -510,7 +524,7 @@ impl Broker {
         &mut self,
         connreq: ConnReq,
         current_connected: ConnectedSession,
-    ) -> Result<(proto::ConnAck, Vec<Event>), SessionError> {
+    ) -> Result<(proto::ConnAck, Vec<ClientEvent>), SessionError> {
         if current_connected.handle() == connreq.handle() {
             // [MQTT-3.1.0-2] - The Server MUST process a second CONNECT Packet
             // sent from a Client as a protocol violation and disconnect the Client.
@@ -747,16 +761,28 @@ mod tests {
         let req2 = ConnReq::new(client_id.clone(), connect2, conn2);
 
         broker_handle
-            .send(Message::new(client_id.clone(), Event::ConnReq(req1)))
+            .send(Message::Client(
+                client_id.clone(),
+                ClientEvent::ConnReq(req1),
+            ))
             .await
             .unwrap();
         broker_handle
-            .send(Message::new(client_id.clone(), Event::ConnReq(req2)))
+            .send(Message::Client(
+                client_id.clone(),
+                ClientEvent::ConnReq(req2),
+            ))
             .await
             .unwrap();
 
-        assert_matches!(rx1.recv().await.unwrap().event(), Event::ConnAck(_));
-        assert_matches!(rx1.recv().await.unwrap().event(), Event::DropConnection);
+        assert_matches!(
+            rx1.recv().await.unwrap(),
+            Message::Client(_, ClientEvent::ConnAck(_))
+        );
+        assert_matches!(
+            rx1.recv().await.unwrap(),
+            Message::Client(_, ClientEvent::DropConnection)
+        );
         assert!(rx1.recv().await.is_none());
     }
 
@@ -794,19 +820,34 @@ mod tests {
         let req2 = ConnReq::new(client_id.clone(), connect2, conn2);
 
         broker_handle
-            .send(Message::new(client_id.clone(), Event::ConnReq(req1)))
+            .send(Message::Client(
+                client_id.clone(),
+                ClientEvent::ConnReq(req1),
+            ))
             .await
             .unwrap();
         broker_handle
-            .send(Message::new(client_id.clone(), Event::ConnReq(req2)))
+            .send(Message::Client(
+                client_id.clone(),
+                ClientEvent::ConnReq(req2),
+            ))
             .await
             .unwrap();
 
-        assert_matches!(rx1.recv().await.unwrap().event(), Event::ConnAck(_));
-        assert_matches!(rx1.recv().await.unwrap().event(), Event::DropConnection);
+        assert_matches!(
+            rx1.recv().await.unwrap(),
+            Message::Client(_, ClientEvent::ConnAck(_))
+        );
+        assert_matches!(
+            rx1.recv().await.unwrap(),
+            Message::Client(_, ClientEvent::DropConnection)
+        );
         assert!(rx1.recv().await.is_none());
 
-        assert_matches!(rx2.recv().await.unwrap().event(), Event::ConnAck(_));
+        assert_matches!(
+            rx2.recv().await.unwrap(),
+            Message::Client(_, ClientEvent::ConnAck(_))
+        );
     }
 
     #[tokio::test]
@@ -830,11 +871,17 @@ mod tests {
         let req1 = ConnReq::new(client_id.clone(), connect1, conn1);
 
         broker_handle
-            .send(Message::new(client_id.clone(), Event::ConnReq(req1)))
+            .send(Message::Client(
+                client_id.clone(),
+                ClientEvent::ConnReq(req1),
+            ))
             .await
             .unwrap();
 
-        assert_matches!(rx1.recv().await.unwrap().event(), Event::DropConnection);
+        assert_matches!(
+            rx1.recv().await.unwrap(),
+            Message::Client(_, ClientEvent::DropConnection)
+        );
         assert!(rx1.recv().await.is_none());
     }
 
@@ -859,21 +906,27 @@ mod tests {
         let req1 = ConnReq::new(client_id.clone(), connect1, conn1);
 
         broker_handle
-            .send(Message::new(client_id.clone(), Event::ConnReq(req1)))
+            .send(Message::Client(
+                client_id.clone(),
+                ClientEvent::ConnReq(req1),
+            ))
             .await
             .unwrap();
 
         assert_matches!(
-            rx1.recv().await.unwrap().event(),
-            Event::ConnAck(proto::ConnAck {
+            rx1.recv().await.unwrap(),
+            Message::Client(_, ClientEvent::ConnAck(proto::ConnAck {
                 return_code:
                     proto::ConnectReturnCode::Refused(
                         proto::ConnectionRefusedReason::UnacceptableProtocolVersion,
                     ),
                 ..
-            })
+            }))
         );
-        assert_matches!(rx1.recv().await.unwrap().event(), Event::DropConnection);
+        assert_matches!(
+            rx1.recv().await.unwrap(),
+            Message::Client(_, ClientEvent::DropConnection)
+        );
         assert!(rx1.recv().await.is_none());
     }
 
