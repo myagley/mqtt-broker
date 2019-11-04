@@ -597,7 +597,7 @@ impl Broker {
             // discard it at any time - if this happens there will be no
             // retained message for that topic
             //
-            // We choose to remove it
+            // We choose to keep it
             if publication.payload.len() == 0 {
                 info!(
                     "removing retained message for topic \"{}\"",
