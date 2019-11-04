@@ -599,10 +599,21 @@ impl Broker {
             //
             // We choose to remove it
             if publication.payload.len() == 0 {
+                info!(
+                    "removing retained message for topic \"{}\"",
+                    publication.topic_name
+                );
                 self.retained.remove(&publication.topic_name);
             } else {
-                self.retained
+                let maybe_retained = self
+                    .retained
                     .insert(publication.topic_name.to_owned(), publication.clone());
+                if maybe_retained.is_none() {
+                    info!(
+                        "new retained message for topic \"{}\"",
+                        publication.topic_name
+                    );
+                }
             }
         }
 
