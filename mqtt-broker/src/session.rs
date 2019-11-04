@@ -8,7 +8,7 @@ use tokio::clock;
 use tracing::{debug, warn};
 
 use crate::subscription::Subscription;
-use crate::{ClientId, ConnReq, ConnectionHandle, Error, ErrorKind, Event, Message, Publish};
+use crate::{ClientEvent, ClientId, ConnReq, ConnectionHandle, Error, ErrorKind, Message, Publish};
 
 const MAX_INFLIGHT_MESSAGES: usize = 16;
 
@@ -47,19 +47,22 @@ impl ConnectedSession {
     pub fn handle_publish(
         &mut self,
         publish: proto::Publish,
-    ) -> Result<(Option<proto::Publication>, Option<Event>), Error> {
+    ) -> Result<(Option<proto::Publication>, Option<ClientEvent>), Error> {
         self.state.handle_publish(publish)
     }
 
-    pub fn handle_puback(&mut self, puback: &proto::PubAck) -> Result<Option<Event>, Error> {
+    pub fn handle_puback(&mut self, puback: &proto::PubAck) -> Result<Option<ClientEvent>, Error> {
         self.state.handle_puback(puback)
     }
 
-    pub fn handle_puback0(&mut self, id: proto::PacketIdentifier) -> Result<Option<Event>, Error> {
+    pub fn handle_puback0(
+        &mut self,
+        id: proto::PacketIdentifier,
+    ) -> Result<Option<ClientEvent>, Error> {
         self.state.handle_puback0(id)
     }
 
-    pub fn handle_pubrec(&mut self, pubrec: proto::PubRec) -> Result<Option<Event>, Error> {
+    pub fn handle_pubrec(&mut self, pubrec: proto::PubRec) -> Result<Option<ClientEvent>, Error> {
         self.state.handle_pubrec(pubrec)
     }
 
@@ -70,11 +73,17 @@ impl ConnectedSession {
         self.state.handle_pubrel(pubrel)
     }
 
-    pub fn handle_pubcomp(&mut self, pubcomp: proto::PubComp) -> Result<Option<Event>, Error> {
+    pub fn handle_pubcomp(
+        &mut self,
+        pubcomp: proto::PubComp,
+    ) -> Result<Option<ClientEvent>, Error> {
         self.state.handle_pubcomp(pubcomp)
     }
 
-    pub fn publish_to(&mut self, publication: proto::Publication) -> Result<Option<Event>, Error> {
+    pub fn publish_to(
+        &mut self,
+        publication: proto::Publication,
+    ) -> Result<Option<ClientEvent>, Error> {
         self.state.publish_to(publication)
     }
 
@@ -125,10 +134,10 @@ impl ConnectedSession {
         Ok(unsuback)
     }
 
-    async fn send(&mut self, event: Event) -> Result<(), Error> {
+    async fn send(&mut self, event: ClientEvent) -> Result<(), Error> {
         self.state.last_active = clock::now();
 
-        let message = Message::new(self.state.client_id.clone(), event);
+        let message = Message::Client(self.state.client_id.clone(), event);
         self.handle
             .send(message)
             .await
@@ -147,12 +156,15 @@ impl OfflineSession {
         Self { state }
     }
 
-    pub fn publish_to(&mut self, publication: proto::Publication) -> Result<Option<Event>, Error> {
+    pub fn publish_to(
+        &mut self,
+        publication: proto::Publication,
+    ) -> Result<Option<ClientEvent>, Error> {
         self.state.queue_publish(publication)?;
         Ok(None)
     }
 
-    pub fn to_online(self) -> Result<(SessionState, Vec<Event>), Error> {
+    pub fn to_online(self) -> Result<(SessionState, Vec<ClientEvent>), Error> {
         let mut events = Vec::with_capacity(MAX_INFLIGHT_MESSAGES);
         let OfflineSession { mut state } = self;
 
@@ -180,18 +192,18 @@ impl OfflineSession {
             };
 
             debug!("resending QoS12 packet {}", id);
-            events.push(Event::PublishTo(to_publish));
+            events.push(ClientEvent::PublishTo(to_publish));
         }
 
         // Handle the outstanding QoS 0 packets
         for (id, publish) in state.waiting_to_be_acked_qos0.iter() {
             debug!("resending QoS0 packet {}", id);
-            events.push(Event::PublishTo(publish.clone()));
+            events.push(ClientEvent::PublishTo(publish.clone()));
         }
 
         // Handle the outstanding QoS 2 packets in the second stage of transmission
         for completed in state.waiting_to_be_completed.iter() {
-            events.push(Event::PubRel(proto::PubRel {
+            events.push(ClientEvent::PubRel(proto::PubRel {
                 packet_identifier: *completed,
             }));
         }
@@ -236,8 +248,8 @@ impl DisconnectingSession {
         self.will
     }
 
-    async fn send(&mut self, event: Event) -> Result<(), Error> {
-        let message = Message::new(self.client_id.clone(), event);
+    async fn send(&mut self, event: ClientEvent) -> Result<(), Error> {
+        let message = Message::Client(self.client_id.clone(), event);
         self.handle
             .send(message)
             .await
@@ -305,7 +317,10 @@ impl SessionState {
 
     /// Takes a publication and returns an optional Publish packet if sending is allowed.
     /// This can return None if the current outstanding messages is at its limit.
-    pub fn publish_to(&mut self, publication: proto::Publication) -> Result<Option<Event>, Error> {
+    pub fn publish_to(
+        &mut self,
+        publication: proto::Publication,
+    ) -> Result<Option<ClientEvent>, Error> {
         if let Some(publication) = self.filter(publication) {
             if self.allowed_to_send() {
                 let event = self.prepare_to_send(publication)?;
@@ -322,7 +337,7 @@ impl SessionState {
     pub fn handle_publish(
         &mut self,
         publish: proto::Publish,
-    ) -> Result<(Option<proto::Publication>, Option<Event>), Error> {
+    ) -> Result<(Option<proto::Publication>, Option<ClientEvent>), Error> {
         let result = match publish.packet_identifier_dup_qos {
             proto::PacketIdentifierDupQoS::AtMostOnce => {
                 let publication = proto::Publication {
@@ -341,28 +356,28 @@ impl SessionState {
                     payload: publish.payload,
                 };
                 let puback = proto::PubAck { packet_identifier };
-                let event = Event::PubAck(puback);
+                let event = ClientEvent::PubAck(puback);
                 (Some(publication), Some(event))
             }
             proto::PacketIdentifierDupQoS::ExactlyOnce(packet_identifier, _dup) => {
                 self.waiting_to_be_released
                     .insert(packet_identifier, publish);
                 let pubrec = proto::PubRec { packet_identifier };
-                let event = Event::PubRec(pubrec);
+                let event = ClientEvent::PubRec(pubrec);
                 (None, Some(event))
             }
         };
         Ok(result)
     }
 
-    pub fn handle_pubrec(&mut self, pubrec: proto::PubRec) -> Result<Option<Event>, Error> {
+    pub fn handle_pubrec(&mut self, pubrec: proto::PubRec) -> Result<Option<ClientEvent>, Error> {
         self.waiting_to_be_acked.remove(&pubrec.packet_identifier);
         self.waiting_to_be_completed
             .insert(pubrec.packet_identifier);
         let pubrel = proto::PubRel {
             packet_identifier: pubrec.packet_identifier,
         };
-        Ok(Some(Event::PubRel(pubrel)))
+        Ok(Some(ClientEvent::PubRel(pubrel)))
     }
 
     pub fn handle_pubrel(
@@ -381,28 +396,34 @@ impl SessionState {
         Ok(publication)
     }
 
-    pub fn handle_pubcomp(&mut self, pubcomp: proto::PubComp) -> Result<Option<Event>, Error> {
+    pub fn handle_pubcomp(
+        &mut self,
+        pubcomp: proto::PubComp,
+    ) -> Result<Option<ClientEvent>, Error> {
         self.waiting_to_be_completed
             .remove(&pubcomp.packet_identifier);
         self.packet_identifiers.discard(pubcomp.packet_identifier);
         self.try_publish()
     }
 
-    pub fn handle_puback(&mut self, puback: &proto::PubAck) -> Result<Option<Event>, Error> {
+    pub fn handle_puback(&mut self, puback: &proto::PubAck) -> Result<Option<ClientEvent>, Error> {
         debug!("discarding packet identifier {}", puback.packet_identifier);
         self.waiting_to_be_acked.remove(&puback.packet_identifier);
         self.packet_identifiers.discard(puback.packet_identifier);
         self.try_publish()
     }
 
-    pub fn handle_puback0(&mut self, id: proto::PacketIdentifier) -> Result<Option<Event>, Error> {
+    pub fn handle_puback0(
+        &mut self,
+        id: proto::PacketIdentifier,
+    ) -> Result<Option<ClientEvent>, Error> {
         debug!("discarding QoS 0 packet identifier {}", id);
         self.waiting_to_be_acked_qos0.remove(&id);
         self.packet_identifiers_qos0.discard(id);
         self.try_publish()
     }
 
-    fn try_publish(&mut self) -> Result<Option<Event>, Error> {
+    fn try_publish(&mut self) -> Result<Option<ClientEvent>, Error> {
         if self.allowed_to_send() {
             if let Some(publication) = self.waiting_to_be_sent.pop_front() {
                 let event = self.prepare_to_send(publication)?;
@@ -433,7 +454,7 @@ impl SessionState {
             })
     }
 
-    fn prepare_to_send(&mut self, publication: proto::Publication) -> Result<Event, Error> {
+    fn prepare_to_send(&mut self, publication: proto::Publication) -> Result<ClientEvent, Error> {
         let publish = match publication.qos {
             proto::QoS::AtMostOnce => {
                 let id = self.packet_identifiers_qos0.reserve()?;
@@ -475,12 +496,12 @@ impl SessionState {
             Publish::QoS0(id, publish) => {
                 self.waiting_to_be_acked_qos0
                     .insert(id, Publish::QoS0(id, publish.clone()));
-                Event::PublishTo(Publish::QoS0(id, publish))
+                ClientEvent::PublishTo(Publish::QoS0(id, publish))
             }
             Publish::QoS12(id, publish) => {
                 self.waiting_to_be_acked
                     .insert(id, Publish::QoS12(id, publish.clone()));
-                Event::PublishTo(Publish::QoS12(id, publish))
+                ClientEvent::PublishTo(Publish::QoS12(id, publish))
             }
         };
         Ok(event)
@@ -535,7 +556,7 @@ impl Session {
     pub fn handle_publish(
         &mut self,
         publish: proto::Publish,
-    ) -> Result<(Option<proto::Publication>, Option<Event>), Error> {
+    ) -> Result<(Option<proto::Publication>, Option<ClientEvent>), Error> {
         match self {
             Session::Transient(connected) => connected.handle_publish(publish),
             Session::Persistent(connected) => connected.handle_publish(publish),
@@ -544,7 +565,7 @@ impl Session {
         }
     }
 
-    pub fn handle_puback(&mut self, puback: &proto::PubAck) -> Result<Option<Event>, Error> {
+    pub fn handle_puback(&mut self, puback: &proto::PubAck) -> Result<Option<ClientEvent>, Error> {
         match self {
             Session::Transient(connected) => connected.handle_puback(puback),
             Session::Persistent(connected) => connected.handle_puback(puback),
@@ -553,7 +574,10 @@ impl Session {
         }
     }
 
-    pub fn handle_puback0(&mut self, id: proto::PacketIdentifier) -> Result<Option<Event>, Error> {
+    pub fn handle_puback0(
+        &mut self,
+        id: proto::PacketIdentifier,
+    ) -> Result<Option<ClientEvent>, Error> {
         match self {
             Session::Transient(connected) => connected.handle_puback0(id),
             Session::Persistent(connected) => connected.handle_puback0(id),
@@ -562,7 +586,7 @@ impl Session {
         }
     }
 
-    pub fn handle_pubrec(&mut self, pubrec: proto::PubRec) -> Result<Option<Event>, Error> {
+    pub fn handle_pubrec(&mut self, pubrec: proto::PubRec) -> Result<Option<ClientEvent>, Error> {
         match self {
             Session::Transient(connected) => connected.handle_pubrec(pubrec),
             Session::Persistent(connected) => connected.handle_pubrec(pubrec),
@@ -583,7 +607,10 @@ impl Session {
         }
     }
 
-    pub fn handle_pubcomp(&mut self, pubcomp: proto::PubComp) -> Result<Option<Event>, Error> {
+    pub fn handle_pubcomp(
+        &mut self,
+        pubcomp: proto::PubComp,
+    ) -> Result<Option<ClientEvent>, Error> {
         match self {
             Session::Transient(connected) => connected.handle_pubcomp(pubcomp),
             Session::Persistent(connected) => connected.handle_pubcomp(pubcomp),
@@ -592,7 +619,10 @@ impl Session {
         }
     }
 
-    pub fn publish_to(&mut self, publication: &proto::Publication) -> Result<Option<Event>, Error> {
+    pub fn publish_to(
+        &mut self,
+        publication: &proto::Publication,
+    ) -> Result<Option<ClientEvent>, Error> {
         match self {
             Session::Transient(connected) => connected.publish_to(publication.to_owned()),
             Session::Persistent(connected) => connected.publish_to(publication.to_owned()),
@@ -625,7 +655,7 @@ impl Session {
         }
     }
 
-    pub async fn send(&mut self, event: Event) -> Result<(), Error> {
+    pub async fn send(&mut self, event: ClientEvent) -> Result<(), Error> {
         match self {
             Session::Transient(ref mut connected) => connected.send(event).await,
             Session::Persistent(ref mut connected) => connected.send(event).await,
@@ -742,7 +772,7 @@ mod tests {
                 qos: proto::QoS::AtMostOnce,
             }],
         };
-        let suback = session.subscribe(subscribe).unwrap();
+        let (suback, subscriptions) = session.subscribe(subscribe).unwrap();
         assert_eq!(
             proto::PacketIdentifier::new(23).unwrap(),
             suback.packet_identifier
@@ -757,6 +787,7 @@ mod tests {
             }
             _ => panic!("not transient"),
         }
+        assert_eq!(1, subscriptions.len());
 
         let subscribe = proto::Subscribe {
             packet_identifier: proto::PacketIdentifier::new(1).unwrap(),
