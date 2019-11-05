@@ -24,9 +24,10 @@ impl Server {
         }
     }
 
-    pub async fn serve<A>(self, addr: A) -> Result<(), Error>
+    pub async fn serve<A, F>(self, addr: A, shutdown_signal: F) -> Result<(), Error>
     where
         A: ToSocketAddrs + Display,
+        F: Future<Output = ()>,
     {
         let Server { broker } = self;
         let handle = broker.handle();
@@ -60,7 +61,7 @@ where
         tokio::spawn(async move {
             if let Err(e) = connection::process(stream, broker_handle)
                 .instrument(span)
-                    .await
+                .await
             {
                 warn!(message = "failed to process connection", error=%e);
             }
