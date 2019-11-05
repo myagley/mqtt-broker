@@ -10,6 +10,7 @@ mod server;
 mod session;
 mod subscription;
 
+pub use crate::broker::BrokerState;
 pub use crate::connection::ConnectionHandle;
 pub use crate::error::{Error, ErrorKind};
 pub use crate::server::Server;
@@ -141,9 +142,9 @@ pub enum ClientEvent {
 
 #[derive(Debug)]
 pub enum SystemEvent {
-    // Shutdown,
-// StateSnapshot,
-// ConfigUpdate,
+    Shutdown,
+    // StateSnapshot,
+    // ConfigUpdate,
 }
 
 #[derive(Debug)]

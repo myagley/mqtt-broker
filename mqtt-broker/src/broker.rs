@@ -9,7 +9,7 @@ use tracing::{debug, info, span, warn, Level};
 use tracing_futures::Instrument;
 
 use crate::session::{ConnectedSession, Session, SessionState};
-use crate::{ClientEvent, ClientId, ConnReq, Error, ErrorKind, Message};
+use crate::{ClientEvent, ClientId, ConnReq, Error, ErrorKind, Message, SystemEvent};
 
 static EXPECTED_PROTOCOL_NAME: &str = "MQTT";
 const EXPECTED_PROTOCOL_LEVEL: u8 = 0x4;
@@ -21,6 +21,8 @@ macro_rules! try_send {
         }
     }};
 }
+
+pub struct BrokerState;
 
 pub struct Broker {
     sender: Sender<Message>,
@@ -44,7 +46,7 @@ impl Broker {
         BrokerHandle(self.sender.clone())
     }
 
-    pub async fn run(mut self) {
+    pub async fn run(mut self) -> BrokerState {
         while let Some(message) = self.messages.recv().await {
             match message {
                 Message::Client(client_id, event) => {
@@ -57,10 +59,14 @@ impl Broker {
                         warn!(message = "an error occurred processing a message", error=%e);
                     }
                 }
-                Message::System(_event) => (),
+                Message::System(SystemEvent::Shutdown) => {
+                    info!("gracefully shutting down the broker...");
+                    break;
+                }
             }
         }
-        info!("broker task exiting");
+        info!("broker is shutdown.");
+        BrokerState
     }
 
     async fn process_message(
