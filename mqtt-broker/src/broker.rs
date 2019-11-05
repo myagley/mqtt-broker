@@ -721,6 +721,7 @@ pub enum SessionError {
 mod tests {
     use super::*;
 
+    use futures_util::future::FutureExt;
     use matches::assert_matches;
     use uuid::Uuid;
 
@@ -761,7 +762,7 @@ mod tests {
     async fn test_double_connect_protocol_violation() {
         let broker = Broker::default();
         let mut broker_handle = broker.handle();
-        tokio::spawn(broker.run());
+        tokio::spawn(broker.run().map(drop));
 
         let connect1 = proto::Connect {
             username: None,
@@ -820,7 +821,7 @@ mod tests {
     async fn test_double_connect_drop_first_transient() {
         let broker = Broker::default();
         let mut broker_handle = broker.handle();
-        tokio::spawn(broker.run());
+        tokio::spawn(broker.run().map(drop));
 
         let connect1 = proto::Connect {
             username: None,
@@ -884,7 +885,7 @@ mod tests {
     async fn test_invalid_protocol_name() {
         let broker = Broker::default();
         let mut broker_handle = broker.handle();
-        tokio::spawn(broker.run());
+        tokio::spawn(broker.run().map(drop));
 
         let connect1 = proto::Connect {
             username: None,
@@ -919,7 +920,7 @@ mod tests {
     async fn test_invalid_protocol_level() {
         let broker = Broker::default();
         let mut broker_handle = broker.handle();
-        tokio::spawn(broker.run());
+        tokio::spawn(broker.run().map(drop));
 
         let connect1 = proto::Connect {
             username: None,
