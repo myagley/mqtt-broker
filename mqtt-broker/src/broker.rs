@@ -9,7 +9,7 @@ use tracing::{debug, info, span, warn, Level};
 use tracing_futures::Instrument;
 
 use crate::session::{ConnectedSession, Session, SessionState};
-use crate::{ClientEvent, ClientId, ConnReq, Error, ErrorKind, Message};
+use crate::{ClientEvent, ClientId, ConnReq, Error, ErrorKind, Message, SystemEvent};
 
 static EXPECTED_PROTOCOL_NAME: &str = "MQTT";
 const EXPECTED_PROTOCOL_LEVEL: u8 = 0x4;
@@ -21,6 +21,9 @@ macro_rules! try_send {
         }
     }};
 }
+
+// TODO: this is a stubbed broker state, implement for real
+pub struct BrokerState;
 
 pub struct Broker {
     sender: Sender<Message>,
@@ -44,7 +47,7 @@ impl Broker {
         BrokerHandle(self.sender.clone())
     }
 
-    pub async fn run(mut self) {
+    pub async fn run(mut self) -> BrokerState {
         while let Some(message) = self.messages.recv().await {
             match message {
                 Message::Client(client_id, event) => {
@@ -57,10 +60,19 @@ impl Broker {
                         warn!(message = "an error occurred processing a message", error=%e);
                     }
                 }
-                Message::System(_event) => (),
+                Message::System(SystemEvent::Shutdown) => {
+                    info!("gracefully shutting down the broker...");
+                    debug!("closing sessions...");
+                    if let Err(e) = self.process_shutdown().await {
+                        warn!(message = "an error occurred shutting down the broker", error=%e);
+                    }
+                    break;
+                }
             }
         }
-        info!("broker task exiting");
+
+        info!("broker is shutdown.");
+        BrokerState
     }
 
     async fn process_message(
@@ -96,6 +108,24 @@ impl Broker {
             warn!(message = "error processing message", %e);
         }
 
+        Ok(())
+    }
+
+    async fn process_shutdown(&mut self) -> Result<(), Error> {
+        let mut sessions = vec![];
+        let client_ids = self.sessions.keys().cloned().collect::<Vec<ClientId>>();
+
+        for client_id in client_ids.into_iter() {
+            if let Some(session) = self.close_session(&client_id) {
+                sessions.push(session)
+            }
+        }
+
+        for mut session in sessions.into_iter() {
+            if let Err(e) = session.send(ClientEvent::DropConnection).await {
+                warn!(error=%e, message = "an error occurred closing the session", client_id = %session.client_id());
+            }
+        }
         Ok(())
     }
 
@@ -499,11 +529,11 @@ impl Broker {
                 let new_session = if let proto::ClientId::IdWithExistingSession(_) =
                     connreq.connect().client_id
                 {
-                    debug!("creating new persistent session for {}", client_id);
+                    info!("creating new persistent session for {}", client_id);
                     let state = SessionState::new(client_id.clone(), &connreq);
                     Session::new_persistent(connreq, state)
                 } else {
-                    debug!("creating new transient session for {}", client_id);
+                    info!("creating new transient session for {}", client_id);
                     Session::new_transient(connreq)
                 };
 
@@ -577,7 +607,7 @@ impl Broker {
     fn close_session(&mut self, client_id: &ClientId) -> Option<Session> {
         match self.sessions.remove(client_id) {
             Some(Session::Transient(connected)) => {
-                debug!("closing transient session for {}", client_id);
+                info!("closing transient session for {}", client_id);
                 let (_state, will, handle) = connected.into_parts();
                 Some(Session::new_disconnecting(client_id.clone(), will, handle))
             }
@@ -586,7 +616,7 @@ impl Broker {
                 // Return a disconnecting session to allow a disconnect
                 // to be sent on the connection
 
-                debug!("moving persistent session to offline for {}", client_id);
+                info!("moving persistent session to offline for {}", client_id);
                 let (state, will, handle) = connected.into_parts();
                 let new_session = Session::new_offline(state);
                 self.sessions.insert(client_id.clone(), new_session);
@@ -691,6 +721,7 @@ pub enum SessionError {
 mod tests {
     use super::*;
 
+    use futures_util::future::FutureExt;
     use matches::assert_matches;
     use uuid::Uuid;
 
@@ -731,7 +762,7 @@ mod tests {
     async fn test_double_connect_protocol_violation() {
         let broker = Broker::default();
         let mut broker_handle = broker.handle();
-        tokio::spawn(broker.run());
+        tokio::spawn(broker.run().map(drop));
 
         let connect1 = proto::Connect {
             username: None,
@@ -790,7 +821,7 @@ mod tests {
     async fn test_double_connect_drop_first_transient() {
         let broker = Broker::default();
         let mut broker_handle = broker.handle();
-        tokio::spawn(broker.run());
+        tokio::spawn(broker.run().map(drop));
 
         let connect1 = proto::Connect {
             username: None,
@@ -854,7 +885,7 @@ mod tests {
     async fn test_invalid_protocol_name() {
         let broker = Broker::default();
         let mut broker_handle = broker.handle();
-        tokio::spawn(broker.run());
+        tokio::spawn(broker.run().map(drop));
 
         let connect1 = proto::Connect {
             username: None,
@@ -889,7 +920,7 @@ mod tests {
     async fn test_invalid_protocol_level() {
         let broker = Broker::default();
         let mut broker_handle = broker.handle();
-        tokio::spawn(broker.run());
+        tokio::spawn(broker.run().map(drop));
 
         let connect1 = proto::Connect {
             username: None,
