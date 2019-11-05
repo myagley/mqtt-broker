@@ -23,5 +23,7 @@ async fn main() -> Result<(), Error> {
     pin_mut!(shutdown);
 
     let _state = Server::new().serve(addr, shutdown).await?;
+
+    // TODO - sync state to disk
     Ok(())
 }

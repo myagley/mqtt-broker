@@ -32,6 +32,10 @@ impl ConnectedSession {
         }
     }
 
+    pub fn client_id(&self) -> &ClientId {
+        &self.state.client_id
+    }
+
     pub fn handle(&self) -> &ConnectionHandle {
         &self.handle
     }
@@ -156,6 +160,10 @@ impl OfflineSession {
         Self { state }
     }
 
+    pub fn client_id(&self) -> &ClientId {
+        &self.state.client_id
+    }
+
     pub fn publish_to(
         &mut self,
         publication: proto::Publication,
@@ -242,6 +250,10 @@ impl DisconnectingSession {
             will,
             handle,
         }
+    }
+
+    pub fn client_id(&self) -> &ClientId {
+        &self.client_id
     }
 
     pub fn into_will(self) -> Option<proto::Publication> {
@@ -542,6 +554,15 @@ impl Session {
     ) -> Self {
         let disconnecting = DisconnectingSession::new(client_id, will, handle);
         Session::Disconnecting(disconnecting)
+    }
+
+    pub fn client_id(&self) -> &ClientId {
+        match self {
+            Session::Transient(connected) => connected.client_id(),
+            Session::Persistent(connected) => connected.client_id(),
+            Session::Offline(offline) => offline.client_id(),
+            Session::Disconnecting(disconnecting) => disconnecting.client_id(),
+        }
     }
 
     pub fn into_will(self) -> Option<proto::Publication> {
