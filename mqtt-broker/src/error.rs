@@ -22,6 +22,12 @@ pub enum ErrorKind {
     #[fail(display = "An error occurred binding the server's listening socket.")]
     BindServer,
 
+    #[fail(display = "An error occurred getting a connection's peer address.")]
+    ConnectionPeerAddress,
+
+    #[fail(display = "An error occurred configuring a connection.")]
+    ConnectionConfiguration,
+
     #[fail(display = "An error occurred decoding a packet.")]
     DecodePacket,
 
