@@ -1,4 +1,5 @@
 use std::fmt;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -71,7 +72,11 @@ impl fmt::Display for ConnectionHandle {
 ///
 /// Receives a source of packets and a handle to the Broker.
 /// Starts two tasks (sending and receiving)
-pub async fn process<I>(io: I, mut broker_handle: BrokerHandle) -> Result<(), Error>
+pub async fn process<I>(
+    io: I,
+    remote_addr: SocketAddr,
+    mut broker_handle: BrokerHandle,
+) -> Result<(), Error>
 where
     I: AsyncRead + AsyncWrite + Unpin,
 {
@@ -94,7 +99,7 @@ where
             let client_id = client_id(&connect.client_id);
             let (sender, events) = mpsc::channel(128);
             let connection_handle = ConnectionHandle::from_sender(sender);
-            let span = span!(Level::INFO, "connection", client_id=%client_id, connection=%connection_handle);
+            let span = span!(Level::INFO, "connection", client_id=%client_id, remote_addr=%remote_addr, connection=%connection_handle);
 
             // async block to attach instrumentation context
             async {

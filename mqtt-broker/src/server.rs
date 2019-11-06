@@ -102,10 +102,17 @@ where
     loop {
         match future::select(&mut shutdown_signal, incoming.next()).await {
             Either::Right((Some(Ok(stream)), _)) => {
+                stream
+                    .set_nodelay(true)
+                    .context(ErrorKind::ConnectionConfiguration)?;
+                let peer = stream
+                    .peer_addr()
+                    .context(ErrorKind::ConnectionPeerAddress)?;
+
                 let broker_handle = handle.clone();
                 let span = span.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = connection::process(stream, broker_handle)
+                    if let Err(e) = connection::process(stream, peer, broker_handle)
                         .instrument(span)
                         .await
                     {
