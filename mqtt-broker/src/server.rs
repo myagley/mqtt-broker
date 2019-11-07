@@ -15,6 +15,7 @@ use tracing_futures::Instrument;
 use crate::broker::{Broker, BrokerHandle, BrokerState};
 use crate::{connection, Error, ErrorKind, Message, SystemEvent};
 
+#[derive(Default)]
 pub struct Server {
     broker: Broker,
 }
@@ -22,7 +23,7 @@ pub struct Server {
 impl Server {
     pub fn new() -> Self {
         Self {
-            broker: Default::default(),
+            broker: Broker::default(),
         }
     }
 

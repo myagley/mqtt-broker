@@ -66,20 +66,20 @@ impl ConnectedSession {
         self.state.handle_puback0(id)
     }
 
-    pub fn handle_pubrec(&mut self, pubrec: proto::PubRec) -> Result<Option<ClientEvent>, Error> {
+    pub fn handle_pubrec(&mut self, pubrec: &proto::PubRec) -> Result<Option<ClientEvent>, Error> {
         self.state.handle_pubrec(pubrec)
     }
 
     pub fn handle_pubrel(
         &mut self,
-        pubrel: proto::PubRel,
+        pubrel: &proto::PubRel,
     ) -> Result<Option<proto::Publication>, Error> {
         self.state.handle_pubrel(pubrel)
     }
 
     pub fn handle_pubcomp(
         &mut self,
-        pubcomp: proto::PubComp,
+        pubcomp: &proto::PubComp,
     ) -> Result<Option<ClientEvent>, Error> {
         self.state.handle_pubcomp(pubcomp)
     }
@@ -99,7 +99,7 @@ impl ConnectedSession {
         let mut acks = Vec::with_capacity(subscribe.subscribe_to.len());
         let packet_identifier = subscribe.packet_identifier;
 
-        for subscribe_to in subscribe.subscribe_to.into_iter() {
+        for subscribe_to in subscribe.subscribe_to {
             let ack_qos = match subscribe_to.topic_filter.parse() {
                 Ok(filter) => {
                     let proto::SubscribeTo { topic_filter, qos } = subscribe_to;
@@ -126,9 +126,9 @@ impl ConnectedSession {
 
     pub fn unsubscribe(
         &mut self,
-        unsubscribe: proto::Unsubscribe,
+        unsubscribe: &proto::Unsubscribe,
     ) -> Result<proto::UnsubAck, Error> {
-        for filter in unsubscribe.unsubscribe_from.iter() {
+        for filter in &unsubscribe.unsubscribe_from {
             self.state.remove_subscription(&filter);
         }
 
@@ -172,12 +172,12 @@ impl OfflineSession {
         Ok(None)
     }
 
-    pub fn to_online(self) -> Result<(SessionState, Vec<ClientEvent>), Error> {
+    pub fn into_online(self) -> Result<(SessionState, Vec<ClientEvent>), Error> {
         let mut events = Vec::with_capacity(MAX_INFLIGHT_MESSAGES);
         let OfflineSession { mut state } = self;
 
         // Handle the outstanding QoS 1 and QoS 2 packets
-        for (id, publish) in state.waiting_to_be_acked.iter() {
+        for (id, publish) in &state.waiting_to_be_acked {
             let to_publish = match publish {
                 Publish::QoS12(id, p) => {
                     let pidq = match p.packet_identifier_dup_qos {
@@ -204,13 +204,13 @@ impl OfflineSession {
         }
 
         // Handle the outstanding QoS 0 packets
-        for (id, publish) in state.waiting_to_be_acked_qos0.iter() {
+        for (id, publish) in &state.waiting_to_be_acked_qos0 {
             debug!("resending QoS0 packet {}", id);
             events.push(ClientEvent::PublishTo(publish.clone()));
         }
 
         // Handle the outstanding QoS 2 packets in the second stage of transmission
-        for completed in state.waiting_to_be_completed.iter() {
+        for completed in &state.waiting_to_be_completed {
             events.push(ClientEvent::PubRel(proto::PubRel {
                 packet_identifier: *completed,
             }));
@@ -221,7 +221,7 @@ impl OfflineSession {
             match state.waiting_to_be_sent.pop_front() {
                 Some(publication) => {
                     debug!("dequeueing a message for {}", state.client_id);
-                    let event = state.prepare_to_send(publication)?;
+                    let event = state.prepare_to_send(&publication)?;
                     events.push(event);
                 }
                 None => break,
@@ -335,7 +335,7 @@ impl SessionState {
     ) -> Result<Option<ClientEvent>, Error> {
         if let Some(publication) = self.filter(publication) {
             if self.allowed_to_send() {
-                let event = self.prepare_to_send(publication)?;
+                let event = self.prepare_to_send(&publication)?;
                 Ok(Some(event))
             } else {
                 self.waiting_to_be_sent.push_back(publication);
@@ -382,7 +382,7 @@ impl SessionState {
         Ok(result)
     }
 
-    pub fn handle_pubrec(&mut self, pubrec: proto::PubRec) -> Result<Option<ClientEvent>, Error> {
+    pub fn handle_pubrec(&mut self, pubrec: &proto::PubRec) -> Result<Option<ClientEvent>, Error> {
         self.waiting_to_be_acked.remove(&pubrec.packet_identifier);
         self.waiting_to_be_completed
             .insert(pubrec.packet_identifier);
@@ -394,7 +394,7 @@ impl SessionState {
 
     pub fn handle_pubrel(
         &mut self,
-        pubrel: proto::PubRel,
+        pubrel: &proto::PubRel,
     ) -> Result<Option<proto::Publication>, Error> {
         let publication = self
             .waiting_to_be_released
@@ -410,7 +410,7 @@ impl SessionState {
 
     pub fn handle_pubcomp(
         &mut self,
-        pubcomp: proto::PubComp,
+        pubcomp: &proto::PubComp,
     ) -> Result<Option<ClientEvent>, Error> {
         self.waiting_to_be_completed
             .remove(&pubcomp.packet_identifier);
@@ -438,7 +438,7 @@ impl SessionState {
     fn try_publish(&mut self) -> Result<Option<ClientEvent>, Error> {
         if self.allowed_to_send() {
             if let Some(publication) = self.waiting_to_be_sent.pop_front() {
-                let event = self.prepare_to_send(publication)?;
+                let event = self.prepare_to_send(&publication)?;
                 return Ok(Some(event));
             }
         }
@@ -466,7 +466,7 @@ impl SessionState {
             })
     }
 
-    fn prepare_to_send(&mut self, publication: proto::Publication) -> Result<ClientEvent, Error> {
+    fn prepare_to_send(&mut self, publication: &proto::Publication) -> Result<ClientEvent, Error> {
         let publish = match publication.qos {
             proto::QoS::AtMostOnce => {
                 let id = self.packet_identifiers_qos0.reserve()?;
@@ -607,7 +607,7 @@ impl Session {
         }
     }
 
-    pub fn handle_pubrec(&mut self, pubrec: proto::PubRec) -> Result<Option<ClientEvent>, Error> {
+    pub fn handle_pubrec(&mut self, pubrec: &proto::PubRec) -> Result<Option<ClientEvent>, Error> {
         match self {
             Session::Transient(connected) => connected.handle_pubrec(pubrec),
             Session::Persistent(connected) => connected.handle_pubrec(pubrec),
@@ -618,7 +618,7 @@ impl Session {
 
     pub fn handle_pubrel(
         &mut self,
-        pubrel: proto::PubRel,
+        pubrel: &proto::PubRel,
     ) -> Result<Option<proto::Publication>, Error> {
         match self {
             Session::Transient(connected) => connected.handle_pubrel(pubrel),
@@ -630,7 +630,7 @@ impl Session {
 
     pub fn handle_pubcomp(
         &mut self,
-        pubcomp: proto::PubComp,
+        pubcomp: &proto::PubComp,
     ) -> Result<Option<ClientEvent>, Error> {
         match self {
             Session::Transient(connected) => connected.handle_pubcomp(pubcomp),
@@ -666,7 +666,7 @@ impl Session {
 
     pub fn unsubscribe(
         &mut self,
-        unsubscribe: proto::Unsubscribe,
+        unsubscribe: &proto::Unsubscribe,
     ) -> Result<proto::UnsubAck, Error> {
         match self {
             Session::Transient(connected) => connected.unsubscribe(unsubscribe),
@@ -863,7 +863,7 @@ mod tests {
             packet_identifier: proto::PacketIdentifier::new(1).unwrap(),
             unsubscribe_from: vec!["topic/different".to_string()],
         };
-        session.unsubscribe(unsubscribe).unwrap();
+        session.unsubscribe(&unsubscribe).unwrap();
 
         match session {
             Session::Transient(ref connected) => {
@@ -880,7 +880,7 @@ mod tests {
             packet_identifier: proto::PacketIdentifier::new(24).unwrap(),
             unsubscribe_from: vec!["topic/new".to_string()],
         };
-        let unsuback = session.unsubscribe(unsubscribe).unwrap();
+        let unsuback = session.unsubscribe(&unsubscribe).unwrap();
         assert_eq!(
             proto::PacketIdentifier::new(24).unwrap(),
             unsuback.packet_identifier
@@ -927,7 +927,7 @@ mod tests {
             packet_identifier: proto::PacketIdentifier::new(24).unwrap(),
             unsubscribe_from: vec!["topic/new".to_string()],
         };
-        let err = session.unsubscribe(unsubscribe).unwrap_err();
+        let err = session.unsubscribe(&unsubscribe).unwrap_err();
         assert_eq!(ErrorKind::SessionOffline, *err.kind());
     }
 
