@@ -83,20 +83,35 @@ impl Broker {
         debug!("incoming: {:?}", event);
         let result = match event {
             ClientEvent::ConnReq(connreq) => self.process_connect(client_id, connreq).await,
-            ClientEvent::ConnAck(_) => Ok(info!("broker received CONNACK, ignoring")),
+            ClientEvent::ConnAck(_) => {
+                info!("broker received CONNACK, ignoring");
+                Ok(())
+            }
             ClientEvent::Disconnect(_) => self.process_disconnect(client_id).await,
             ClientEvent::DropConnection => self.process_drop_connection(client_id).await,
             ClientEvent::CloseSession => self.process_close_session(client_id).await,
             ClientEvent::PingReq(ping) => self.process_ping_req(client_id, ping).await,
-            ClientEvent::PingResp(_) => Ok(info!("broker received PINGRESP, ignoring")),
+            ClientEvent::PingResp(_) => {
+                info!("broker received PINGRESP, ignoring");
+                Ok(())
+            }
             ClientEvent::Subscribe(subscribe) => self.process_subscribe(client_id, subscribe).await,
-            ClientEvent::SubAck(_) => Ok(info!("broker received SUBACK, ignoring")),
+            ClientEvent::SubAck(_) => {
+                info!("broker received SUBACK, ignoring");
+                Ok(())
+            }
             ClientEvent::Unsubscribe(unsubscribe) => {
                 self.process_unsubscribe(client_id, unsubscribe).await
             }
-            ClientEvent::UnsubAck(_) => Ok(info!("broker received UNSUBACK, ignoring")),
+            ClientEvent::UnsubAck(_) => {
+                info!("broker received UNSUBACK, ignoring");
+                Ok(())
+            }
             ClientEvent::PublishFrom(publish) => self.process_publish(client_id, publish).await,
-            ClientEvent::PublishTo(_publish) => Ok(info!("broker received a PublishTo, ignoring")),
+            ClientEvent::PublishTo(_publish) => {
+                info!("broker received a PublishTo, ignoring");
+                Ok(())
+            }
             ClientEvent::PubAck0(id) => self.process_puback0(client_id, id).await,
             ClientEvent::PubAck(puback) => self.process_puback(client_id, puback).await,
             ClientEvent::PubRec(pubrec) => self.process_pubrec(client_id, pubrec).await,
@@ -115,13 +130,13 @@ impl Broker {
         let mut sessions = vec![];
         let client_ids = self.sessions.keys().cloned().collect::<Vec<ClientId>>();
 
-        for client_id in client_ids.into_iter() {
+        for client_id in client_ids {
             if let Some(session) = self.close_session(&client_id) {
                 sessions.push(session)
             }
         }
 
-        for mut session in sessions.into_iter() {
+        for mut session in sessions {
             if let Err(e) = session.send(ClientEvent::DropConnection).await {
                 warn!(error=%e, message = "an error occurred closing the session", client_id = %session.client_id());
             }
@@ -143,7 +158,7 @@ impl Broker {
         // CONNECT packet in line with this specification.
         //
         // We will simply disconnect the client and return.
-        if &connreq.connect().protocol_name != EXPECTED_PROTOCOL_NAME {
+        if connreq.connect().protocol_name != EXPECTED_PROTOCOL_NAME {
             warn!(
                 "invalid protocol name received from client: {}",
                 connreq.connect().protocol_name
@@ -189,7 +204,7 @@ impl Broker {
                 let session = self.get_session_mut(&client_id)?;
                 session.send(ClientEvent::ConnAck(ack)).await?;
 
-                for event in events.into_iter() {
+                for event in events {
                     session.send(event).await?;
                 }
             }
@@ -332,7 +347,7 @@ impl Broker {
     ) -> Result<(), Error> {
         match self.get_session_mut(&client_id) {
             Ok(session) => {
-                let unsuback = session.unsubscribe(unsubscribe)?;
+                let unsuback = session.unsubscribe(&unsubscribe)?;
                 session.send(ClientEvent::UnsubAck(unsuback)).await
             }
             Err(e) if *e.kind() == ErrorKind::NoSession => {
@@ -416,7 +431,7 @@ impl Broker {
     ) -> Result<(), Error> {
         match self.get_session_mut(&client_id) {
             Ok(session) => {
-                if let Some(event) = session.handle_pubrec(pubrec)? {
+                if let Some(event) = session.handle_pubrec(&pubrec)? {
                     session.send(event).await?
                 }
                 Ok(())
@@ -437,7 +452,7 @@ impl Broker {
         let maybe_publication = match self.get_session_mut(&client_id) {
             Ok(session) => {
                 let packet_identifier = pubrel.packet_identifier;
-                let maybe_publication = session.handle_pubrel(pubrel)?;
+                let maybe_publication = session.handle_pubrel(&pubrel)?;
 
                 let pubcomp = proto::PubComp { packet_identifier };
                 session.send(ClientEvent::PubComp(pubcomp)).await?;
@@ -463,7 +478,7 @@ impl Broker {
     ) -> Result<(), Error> {
         match self.get_session_mut(&client_id) {
             Ok(session) => {
-                if let Some(event) = session.handle_pubcomp(pubcomp)? {
+                if let Some(event) = session.handle_pubcomp(&pubcomp)? {
                     session.send(event).await?
                 }
                 Ok(())
@@ -479,7 +494,7 @@ impl Broker {
     fn get_session_mut(&mut self, client_id: &ClientId) -> Result<&mut Session, Error> {
         self.sessions
             .get_mut(client_id)
-            .ok_or(Error::new(ErrorKind::NoSession.into()))
+            .ok_or_else(|| Error::new(ErrorKind::NoSession.into()))
     }
 
     fn open_session(
@@ -502,7 +517,7 @@ impl Broker {
                     if let proto::ClientId::IdWithExistingSession(_) = connreq.connect().client_id {
                         debug!("moving offline session to online for {}", client_id);
                         let (state, events) = offline
-                            .to_online()
+                            .into_online()
                             .map_err(|_e| SessionError::PacketIdentifiersExhausted)?;
                         let new_session = Session::new_persistent(connreq, state);
                         (new_session, events, true)
@@ -642,7 +657,7 @@ impl Broker {
             // retained message for that topic
             //
             // We choose to keep it
-            if publication.payload.len() == 0 {
+            if publication.payload.is_empty() {
                 info!(
                     "removing retained message for topic \"{}\"",
                     publication.topic_name

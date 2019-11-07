@@ -283,14 +283,12 @@ where
                     debug!("asked to drop connection. outgoing_task completing...");
                     return Ok(());
                 }
-                ClientEvent::CloseSession => None,
                 ClientEvent::PingReq(req) => Some(Packet::PingReq(req)),
                 ClientEvent::PingResp(response) => Some(Packet::PingResp(response)),
                 ClientEvent::Subscribe(sub) => Some(Packet::Subscribe(sub)),
                 ClientEvent::SubAck(suback) => Some(Packet::SubAck(suback)),
                 ClientEvent::Unsubscribe(unsub) => Some(Packet::Unsubscribe(unsub)),
                 ClientEvent::UnsubAck(unsuback) => Some(Packet::UnsubAck(unsuback)),
-                ClientEvent::PublishFrom(_publish) => None,
                 ClientEvent::PublishTo(Publish::QoS12(_id, publish)) => {
                     Some(Packet::Publish(publish))
                 }
@@ -307,16 +305,19 @@ where
                         let message = Message::Client(client_id.clone(), ClientEvent::PubAck0(id));
                         if let Err(e) = broker.send(message).await {
                             warn!(message = "error occurred while sending QoS ack to broker", error=%e);
-                            return Err((messages, e.into()));
+                            return Err((messages, e));
                         }
                     }
                     None
                 }
-                ClientEvent::PubAck0(_id) => None,
                 ClientEvent::PubAck(puback) => Some(Packet::PubAck(puback)),
                 ClientEvent::PubRec(pubrec) => Some(Packet::PubRec(pubrec)),
                 ClientEvent::PubRel(pubrel) => Some(Packet::PubRel(pubrel)),
                 ClientEvent::PubComp(pubcomp) => Some(Packet::PubComp(pubcomp)),
+                event => {
+                    warn!("ignoring event for outgoing_task: {:?}", event);
+                    None
+                }
             },
             Message::System(_event) => None,
         };

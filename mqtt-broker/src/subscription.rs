@@ -55,14 +55,14 @@ impl TopicFilter {
 
         if let Some(Segment::MultiLevelWildcard) = segment {
             if let Some(l) = level {
-                if l.starts_with("$") {
+                if l.starts_with('$') {
                     return false;
                 }
             }
         }
         match (segment, level) {
-            (Some(Segment::MultiLevelWildcard), Some(l)) if l.starts_with("$") => return false,
-            (Some(Segment::SingleLevelWildcard), Some(l)) if l.starts_with("$") => return false,
+            (Some(Segment::MultiLevelWildcard), Some(l)) if l.starts_with('$') => return false,
+            (Some(Segment::SingleLevelWildcard), Some(l)) if l.starts_with('$') => return false,
             (_, _) => (),
         }
 
@@ -78,7 +78,7 @@ impl TopicFilter {
             segment = segments.next();
             level = levels.next();
         }
-        return true;
+        true
     }
 }
 
