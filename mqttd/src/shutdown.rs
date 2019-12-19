@@ -6,7 +6,7 @@ pub async fn shutdown() {
 mod imp {
     use futures_util::future::{self, Either};
     use futures_util::stream::StreamExt;
-    use tokio_net::signal::unix::{signal, SignalKind};
+    use tokio::signal::unix::{signal, SignalKind};
     use tracing::info;
 
     pub(super) async fn shutdown() {

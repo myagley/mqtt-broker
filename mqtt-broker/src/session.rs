@@ -1,10 +1,10 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use std::{cmp, fmt, mem};
 
 use failure::ResultExt;
 use mqtt::proto;
-use tokio::clock;
+use tokio::time::Instant;
 use tracing::{debug, warn};
 
 use crate::subscription::Subscription;
@@ -139,7 +139,7 @@ impl ConnectedSession {
     }
 
     async fn send(&mut self, event: ClientEvent) -> Result<(), Error> {
-        self.state.last_active = clock::now();
+        self.state.last_active = Instant::now();
 
         let message = Message::Client(self.state.client_id.clone(), event);
         self.handle
@@ -295,7 +295,7 @@ impl SessionState {
         Self {
             client_id,
             keep_alive: connreq.connect().keep_alive,
-            last_active: clock::now(),
+            last_active: Instant::now(),
             subscriptions: HashMap::new(),
             packet_identifiers: PacketIdentifiers::default(),
             packet_identifiers_qos0: PacketIdentifiers::default(),

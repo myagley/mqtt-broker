@@ -17,7 +17,7 @@ const EXPECTED_PROTOCOL_LEVEL: u8 = 0x4;
 macro_rules! try_send {
     ($session:expr, $msg:expr) => {{
         if let Err(e) = $session.send($msg).await {
-            warn!(message = "error processing message", %e);
+            warn!(message = "error processing message", error=%e);
         }
     }};
 }
