@@ -6,10 +6,9 @@ use failure::ResultExt;
 use futures_util::future::{self, Either, FutureExt};
 use futures_util::pin_mut;
 use futures_util::stream::StreamExt;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, ToSocketAddrs};
 use tokio::sync::oneshot;
-use tokio_net::ToSocketAddrs;
-use tracing::{debug, info, span, warn, Level};
+use tracing::{debug, error, info, span, warn, Level};
 use tracing_futures::Instrument;
 
 use crate::broker::{Broker, BrokerHandle, BrokerState};
@@ -66,10 +65,17 @@ impl Server {
                 }
             }
             Either::Right((either, _shutdown)) => match either {
-                Either::Right((_, broker_task)) => {
+                Either::Right((Ok(_incoming_task), broker_task)) => {
                     debug!("sending Shutdown message to broker");
                     handle.send(Message::System(SystemEvent::Shutdown)).await?;
                     broker_task.await
+                }
+                Either::Right((Err(e), broker_task)) => {
+                    error!(message = "an error occurred in the accept loop", error=%e);
+                    debug!("sending Shutdown message to broker");
+                    handle.send(Message::System(SystemEvent::Shutdown)).await?;
+                    broker_task.await;
+                    return Err(e);
                 }
                 Either::Left((broker_state, incoming_task)) => {
                     warn!("broker exited before accept loop");
@@ -94,10 +100,11 @@ where
     let span = span!(Level::INFO, "server", listener=%addr);
     let _enter = span.enter();
 
-    let mut incoming = TcpListener::bind(&addr)
+    let mut listener = TcpListener::bind(&addr)
         .await
-        .context(ErrorKind::BindServer)?
-        .incoming();
+        .context(ErrorKind::BindServer)?;
+    let mut incoming = listener.incoming();
+
     info!("Listening on address {}", addr);
 
     loop {
