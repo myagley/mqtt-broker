@@ -36,7 +36,7 @@ impl Server {
 
         let (itx, irx) = oneshot::channel::<()>();
 
-        let broker_task = broker.run();
+        let broker_task = tokio::spawn(broker.run());
         let incoming_task = incoming_task(addr, handle.clone(), irx.map(drop));
         pin_mut!(broker_task);
         pin_mut!(incoming_task);
@@ -55,12 +55,12 @@ impl Server {
                     Either::Right((_, broker_task)) => {
                         debug!("sending Shutdown message to broker");
                         handle.send(Message::System(SystemEvent::Shutdown)).await?;
-                        broker_task.await
+                        broker_task.await.context(ErrorKind::BrokerJoin)?
                     }
                     Either::Left((broker_state, incoming_task)) => {
                         warn!("broker exited before accept loop");
                         incoming_task.await?;
-                        broker_state
+                        broker_state.context(ErrorKind::BrokerJoin)?
                     }
                 }
             }
@@ -68,19 +68,19 @@ impl Server {
                 Either::Right((Ok(_incoming_task), broker_task)) => {
                     debug!("sending Shutdown message to broker");
                     handle.send(Message::System(SystemEvent::Shutdown)).await?;
-                    broker_task.await
+                    broker_task.await.context(ErrorKind::BrokerJoin)?
                 }
                 Either::Right((Err(e), broker_task)) => {
                     error!(message = "an error occurred in the accept loop", error=%e);
                     debug!("sending Shutdown message to broker");
                     handle.send(Message::System(SystemEvent::Shutdown)).await?;
-                    broker_task.await;
+                    broker_task.await.context(ErrorKind::BrokerJoin)?;
                     return Err(e);
                 }
                 Either::Left((broker_state, incoming_task)) => {
                     warn!("broker exited before accept loop");
                     incoming_task.await?;
-                    broker_state
+                    broker_state.context(ErrorKind::BrokerJoin)?
                 }
             },
         };
