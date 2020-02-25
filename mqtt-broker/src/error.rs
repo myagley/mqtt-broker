@@ -54,6 +54,9 @@ pub enum ErrorKind {
 
     #[fail(display = "All packet identifiers are exhausted.")]
     PacketIdentifiersExhausted,
+
+    #[fail(display = "An error occurred joining the broker task.")]
+    BrokerJoin,
 }
 
 impl Fail for Error {

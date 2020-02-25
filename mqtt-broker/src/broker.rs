@@ -1,8 +1,6 @@
 use std::collections::HashMap;
 
 use failure::ResultExt;
-use futures_util::stream::futures_unordered::FuturesUnordered;
-use futures_util::stream::StreamExt;
 use mqtt::proto;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tracing::{debug, info, span, warn, Level};
@@ -682,19 +680,12 @@ impl Broker {
         // This will not happen here.
         publication.retain = false;
 
-        self.sessions
-            .values_mut()
-            .map(|session| publish_to(session, &publication))
-            .collect::<FuturesUnordered<_>>()
-            .fold(Ok(()), |acc, res| {
-                async move {
-                    match (acc, res) {
-                        (Ok(()), Err(e)) => Err(e),
-                        (a, _) => a,
-                    }
-                }
-            })
-            .await?;
+        for session in self.sessions.values_mut() {
+            if let Err(e) = publish_to(session, &publication).await {
+                warn!(message = "error processing message", error=%e);
+            }
+        }
+
         Ok(())
     }
 }
