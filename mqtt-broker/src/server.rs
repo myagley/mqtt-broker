@@ -21,9 +21,11 @@ pub struct Server {
 
 impl Server {
     pub fn new() -> Self {
-        Self {
-            broker: Broker::default(),
-        }
+        Self::from_broker(Broker::default())
+    }
+
+    pub fn from_broker(broker: Broker) -> Self {
+        Self { broker }
     }
 
     pub async fn serve<A, F>(self, addr: A, shutdown_signal: F) -> Result<BrokerState, Error>

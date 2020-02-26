@@ -368,6 +368,7 @@ name = "mqttd"
 version = "0.1.0"
 dependencies = [
  "atty 0.2.13 (registry+https://github.com/rust-lang/crates.io-index)",
+ "failure 0.1.6 (registry+https://github.com/rust-lang/crates.io-index)",
  "futures-util 0.3.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "mqtt-broker 0.1.0",
  "tokio 0.2.10 (registry+https://github.com/rust-lang/crates.io-index)",

@@ -23,7 +23,7 @@ mod session;
 mod snapshot;
 mod subscription;
 
-pub use crate::broker::{Broker, BrokerState};
+pub use crate::broker::{Broker, BrokerHandle, BrokerState};
 pub use crate::connection::ConnectionHandle;
 pub use crate::error::{Error, ErrorKind};
 pub use crate::persist::{NullPersistor, Persist};

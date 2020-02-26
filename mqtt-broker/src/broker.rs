@@ -41,6 +41,17 @@ impl Broker {
         }
     }
 
+    pub fn from_state(_state: BrokerState) -> Self {
+        // TODO use the state
+        let (sender, messages) = mpsc::channel(1024);
+        Self {
+            sender,
+            messages,
+            sessions: HashMap::new(),
+            retained: HashMap::new(),
+        }
+    }
+
     pub fn handle(&self) -> BrokerHandle {
         BrokerHandle(self.sender.clone())
     }

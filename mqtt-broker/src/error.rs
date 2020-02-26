@@ -10,6 +10,9 @@ pub struct Error {
 
 #[derive(Debug, Fail, PartialEq)]
 pub enum ErrorKind {
+    #[fail(display = "A general error occurred in the server.")]
+    General,
+
     #[fail(display = "An error occurred trying to connect.")]
     Connect,
 

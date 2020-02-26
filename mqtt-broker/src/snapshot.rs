@@ -76,7 +76,7 @@ where
                     }
                 }
                 Event::Shutdown => {
-                    info!("state snapshotter shutting down");
+                    info!("state snapshotter shutting down...");
                     break;
                 }
             }
