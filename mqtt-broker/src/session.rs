@@ -1,10 +1,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::time::Duration;
 use std::{cmp, fmt, mem};
 
 use failure::ResultExt;
 use mqtt::proto;
-use tokio::time::Instant;
 use tracing::{debug, warn};
 
 use crate::subscription::Subscription;
@@ -139,8 +137,6 @@ impl ConnectedSession {
     }
 
     async fn send(&mut self, event: ClientEvent) -> Result<(), Error> {
-        self.state.last_active = Instant::now();
-
         let message = Message::Client(self.state.client_id.clone(), event);
         self.handle
             .send(message)
@@ -270,11 +266,9 @@ impl DisconnectingSession {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct SessionState {
     client_id: ClientId,
-    keep_alive: Duration,
-    last_active: Instant,
     subscriptions: HashMap<String, Subscription>,
     packet_identifiers: PacketIdentifiers,
     packet_identifiers_qos0: PacketIdentifiers,
@@ -291,11 +285,9 @@ pub struct SessionState {
 }
 
 impl SessionState {
-    pub fn new(client_id: ClientId, connreq: &ConnReq) -> Self {
+    pub fn new(client_id: ClientId) -> Self {
         Self {
             client_id,
-            keep_alive: connreq.connect().keep_alive,
-            last_active: Instant::now(),
             subscriptions: HashMap::new(),
             packet_identifiers: PacketIdentifiers::default(),
             packet_identifiers_qos0: PacketIdentifiers::default(),
@@ -530,7 +522,7 @@ pub enum Session {
 
 impl Session {
     pub fn new_transient(connreq: ConnReq) -> Self {
-        let state = SessionState::new(connreq.client_id().clone(), &connreq);
+        let state = SessionState::new(connreq.client_id().clone());
         let (connect, handle) = connreq.into_parts();
         let connected = ConnectedSession::new(state, connect.will, handle);
         Session::Transient(connected)
@@ -686,6 +678,7 @@ impl Session {
     }
 }
 
+#[derive(Clone)]
 struct PacketIdentifiers {
     in_use: Box<[usize; PacketIdentifiers::SIZE]>,
     previous: proto::PacketIdentifier,
@@ -898,10 +891,7 @@ mod tests {
     fn test_offline_subscribe() {
         let id = "id1".to_string();
         let client_id = ClientId::from(id.clone());
-        let connect1 = transient_connect(id.clone());
-        let handle1 = connection_handle();
-        let req1 = ConnReq::new(client_id.clone(), connect1, handle1);
-        let mut session = Session::new_offline(SessionState::new(client_id, &req1));
+        let mut session = Session::new_offline(SessionState::new(client_id));
 
         let subscribe = proto::Subscribe {
             packet_identifier: proto::PacketIdentifier::new(1).unwrap(),
@@ -918,10 +908,7 @@ mod tests {
     fn test_offline_unsubscribe() {
         let id = "id1".to_string();
         let client_id = ClientId::from(id.clone());
-        let connect1 = transient_connect(id.clone());
-        let handle1 = connection_handle();
-        let req1 = ConnReq::new(client_id.clone(), connect1, handle1);
-        let mut session = Session::new_offline(SessionState::new(client_id, &req1));
+        let mut session = Session::new_offline(SessionState::new(client_id));
 
         let unsubscribe = proto::Unsubscribe {
             packet_identifier: proto::PacketIdentifier::new(24).unwrap(),

@@ -28,7 +28,7 @@ pub use crate::connection::ConnectionHandle;
 pub use crate::error::{Error, ErrorKind};
 pub use crate::persist::{NullPersistor, Persist};
 pub use crate::server::Server;
-pub use crate::snapshot::Snapshotter;
+pub use crate::snapshot::{Snapshotter, StateSnapshotHandle};
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ClientId(Arc<String>);
@@ -158,7 +158,7 @@ pub enum ClientEvent {
 #[derive(Debug)]
 pub enum SystemEvent {
     Shutdown,
-    // StateSnapshot,
+    StateSnapshot(StateSnapshotHandle),
     // ConfigUpdate,
 }
 
