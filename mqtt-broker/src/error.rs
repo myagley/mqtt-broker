@@ -19,6 +19,9 @@ pub enum ErrorKind {
     #[fail(display = "An error occurred sending a message to a connection.")]
     SendConnectionMessage,
 
+    #[fail(display = "An error occurred sending a message to a snapshotter.")]
+    SendSnapshotMessage,
+
     #[fail(display = "An error occurred binding the server's listening socket.")]
     BindServer,
 
