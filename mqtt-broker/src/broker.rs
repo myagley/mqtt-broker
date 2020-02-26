@@ -20,24 +20,28 @@ macro_rules! try_send {
     }};
 }
 
-// TODO: this is a stubbed broker state, implement for real
-pub struct BrokerState;
+pub struct BrokerState {
+    sessions: HashMap<ClientId, Session>,
+    retained: HashMap<String, proto::Publication>,
+}
 
 pub struct Broker {
     sender: Sender<Message>,
     messages: Receiver<Message>,
-    sessions: HashMap<ClientId, Session>,
-    retained: HashMap<String, proto::Publication>,
+    state: BrokerState,
 }
 
 impl Broker {
     pub fn new() -> Self {
         let (sender, messages) = mpsc::channel(1024);
+        let state = BrokerState {
+            sessions: HashMap::new(),
+            retained: HashMap::new(),
+        };
         Self {
             sender,
             messages,
-            sessions: HashMap::new(),
-            retained: HashMap::new(),
+            state,
         }
     }
 
@@ -70,7 +74,7 @@ impl Broker {
         }
 
         info!("broker is shutdown.");
-        BrokerState
+        self.state
     }
 
     async fn process_message(
@@ -126,7 +130,12 @@ impl Broker {
 
     async fn process_shutdown(&mut self) -> Result<(), Error> {
         let mut sessions = vec![];
-        let client_ids = self.sessions.keys().cloned().collect::<Vec<ClientId>>();
+        let client_ids = self
+            .state
+            .sessions
+            .keys()
+            .cloned()
+            .collect::<Vec<ClientId>>();
 
         for client_id in client_ids {
             if let Some(session) = self.close_session(&client_id) {
@@ -312,6 +321,7 @@ impl Broker {
 
         // Handle retained messages
         let publications = self
+            .state
             .retained
             .values()
             .filter(|p| {
@@ -490,7 +500,8 @@ impl Broker {
     }
 
     fn get_session_mut(&mut self, client_id: &ClientId) -> Result<&mut Session, Error> {
-        self.sessions
+        self.state
+            .sessions
             .get_mut(client_id)
             .ok_or_else(|| Error::new(ErrorKind::NoSession.into()))
     }
@@ -501,7 +512,7 @@ impl Broker {
     ) -> Result<(proto::ConnAck, Vec<ClientEvent>), SessionError> {
         let client_id = connreq.client_id().clone();
 
-        match self.sessions.remove(&client_id) {
+        match self.state.sessions.remove(&client_id) {
             Some(Session::Transient(current_connected)) => {
                 self.open_session_connected(connreq, current_connected)
             }
@@ -525,7 +536,7 @@ impl Broker {
                         (new_session, vec![], false)
                     };
 
-                self.sessions.insert(client_id, new_session);
+                self.state.sessions.insert(client_id, new_session);
 
                 let ack = proto::ConnAck {
                     session_present,
@@ -550,7 +561,7 @@ impl Broker {
                     Session::new_transient(connreq)
                 };
 
-                self.sessions.insert(client_id.clone(), new_session);
+                self.state.sessions.insert(client_id.clone(), new_session);
 
                 let ack = proto::ConnAck {
                     session_present: false,
@@ -607,7 +618,7 @@ impl Broker {
                     (new_session, false)
                 };
 
-            self.sessions.insert(client_id, new_session);
+            self.state.sessions.insert(client_id, new_session);
             let ack = proto::ConnAck {
                 session_present,
                 return_code: proto::ConnectReturnCode::Accepted,
@@ -618,7 +629,7 @@ impl Broker {
     }
 
     fn close_session(&mut self, client_id: &ClientId) -> Option<Session> {
-        match self.sessions.remove(client_id) {
+        match self.state.sessions.remove(client_id) {
             Some(Session::Transient(connected)) => {
                 info!("closing transient session for {}", client_id);
                 let (_state, will, handle) = connected.into_parts();
@@ -632,12 +643,13 @@ impl Broker {
                 info!("moving persistent session to offline for {}", client_id);
                 let (state, will, handle) = connected.into_parts();
                 let new_session = Session::new_offline(state);
-                self.sessions.insert(client_id.clone(), new_session);
+                self.state.sessions.insert(client_id.clone(), new_session);
                 Some(Session::new_disconnecting(client_id.clone(), will, handle))
             }
             Some(Session::Offline(offline)) => {
                 debug!("closing already offline session for {}", client_id);
-                self.sessions
+                self.state
+                    .sessions
                     .insert(client_id.clone(), Session::Offline(offline));
                 None
             }
@@ -660,9 +672,10 @@ impl Broker {
                     "removing retained message for topic \"{}\"",
                     publication.topic_name
                 );
-                self.retained.remove(&publication.topic_name);
+                self.state.retained.remove(&publication.topic_name);
             } else {
                 let maybe_retained = self
+                    .state
                     .retained
                     .insert(publication.topic_name.to_owned(), publication.clone());
                 if maybe_retained.is_none() {
@@ -680,7 +693,7 @@ impl Broker {
         // This will not happen here.
         publication.retain = false;
 
-        for session in self.sessions.values_mut() {
+        for session in self.state.sessions.values_mut() {
             if let Err(e) = publish_to(session, &publication).await {
                 warn!(message = "error processing message", error=%e);
             }
@@ -979,13 +992,13 @@ mod tests {
         broker.open_session(req).unwrap();
 
         // check new session
-        assert_eq!(1, broker.sessions.len());
-        assert_matches!(broker.sessions[&client_id], Session::Transient(_));
+        assert_eq!(1, broker.state.sessions.len());
+        assert_matches!(broker.state.sessions[&client_id], Session::Transient(_));
 
         // close session and check behavior
         let old_session = broker.close_session(&client_id);
         assert_matches!(old_session, Some(Session::Disconnecting(_)));
-        assert_eq!(0, broker.sessions.len());
+        assert_eq!(0, broker.state.sessions.len());
     }
 
     #[test]
@@ -999,14 +1012,14 @@ mod tests {
 
         broker.open_session(req).unwrap();
 
-        assert_eq!(1, broker.sessions.len());
-        assert_matches!(broker.sessions[&client_id], Session::Persistent(_));
+        assert_eq!(1, broker.state.sessions.len());
+        assert_matches!(broker.state.sessions[&client_id], Session::Persistent(_));
 
         // close session and check behavior
         let old_session = broker.close_session(&client_id);
         assert_matches!(old_session, Some(Session::Disconnecting(_)));
-        assert_eq!(1, broker.sessions.len());
-        assert_matches!(broker.sessions[&client_id], Session::Offline(_));
+        assert_eq!(1, broker.state.sessions.len());
+        assert_matches!(broker.state.sessions[&client_id], Session::Offline(_));
     }
 
     #[test]
@@ -1026,11 +1039,11 @@ mod tests {
         let req2 = ConnReq::new(client_id.clone(), connect2, handle2);
 
         broker.open_session(req1).unwrap();
-        assert_eq!(1, broker.sessions.len());
+        assert_eq!(1, broker.state.sessions.len());
 
         let result = broker.open_session(req2);
         assert_matches!(result, Err(SessionError::ProtocolViolation(_)));
-        assert_eq!(0, broker.sessions.len());
+        assert_eq!(0, broker.state.sessions.len());
     }
 
     #[test]
@@ -1050,11 +1063,11 @@ mod tests {
         let req2 = ConnReq::new(client_id.clone(), connect2, handle2);
 
         broker.open_session(req1).unwrap();
-        assert_eq!(1, broker.sessions.len());
+        assert_eq!(1, broker.state.sessions.len());
 
         let result = broker.open_session(req2);
         assert_matches!(result, Err(SessionError::ProtocolViolation(_)));
-        assert_eq!(0, broker.sessions.len());
+        assert_eq!(0, broker.state.sessions.len());
     }
 
     #[test]
@@ -1069,13 +1082,13 @@ mod tests {
         let req1 = ConnReq::new(client_id.clone(), connect1, handle1);
 
         broker.open_session(req1).unwrap();
-        assert_eq!(1, broker.sessions.len());
+        assert_eq!(1, broker.state.sessions.len());
 
         let req2 = ConnReq::new(client_id.clone(), connect2, handle2);
         let result = broker.open_session(req2);
         assert_matches!(result, Err(SessionError::DuplicateSession(_, _)));
-        assert_matches!(broker.sessions[&client_id], Session::Transient(_));
-        assert_eq!(1, broker.sessions.len());
+        assert_matches!(broker.state.sessions[&client_id], Session::Transient(_));
+        assert_eq!(1, broker.state.sessions.len());
     }
 
     #[test]
@@ -1090,13 +1103,13 @@ mod tests {
         let req1 = ConnReq::new(client_id.clone(), connect1, handle1);
 
         broker.open_session(req1).unwrap();
-        assert_eq!(1, broker.sessions.len());
+        assert_eq!(1, broker.state.sessions.len());
 
         let req2 = ConnReq::new(client_id.clone(), connect2, handle2);
         let result = broker.open_session(req2);
         assert_matches!(result, Err(SessionError::DuplicateSession(_, _)));
-        assert_matches!(broker.sessions[&client_id], Session::Persistent(_));
-        assert_eq!(1, broker.sessions.len());
+        assert_matches!(broker.state.sessions[&client_id], Session::Persistent(_));
+        assert_eq!(1, broker.state.sessions.len());
     }
 
     #[test]
@@ -1111,13 +1124,13 @@ mod tests {
         let req1 = ConnReq::new(client_id.clone(), connect1, handle1);
 
         broker.open_session(req1).unwrap();
-        assert_eq!(1, broker.sessions.len());
+        assert_eq!(1, broker.state.sessions.len());
 
         let req2 = ConnReq::new(client_id.clone(), connect2, handle2);
         let result = broker.open_session(req2);
         assert_matches!(result, Err(SessionError::DuplicateSession(_, _)));
-        assert_matches!(broker.sessions[&client_id], Session::Transient(_));
-        assert_eq!(1, broker.sessions.len());
+        assert_matches!(broker.state.sessions[&client_id], Session::Transient(_));
+        assert_eq!(1, broker.state.sessions.len());
     }
 
     #[test]
@@ -1133,12 +1146,12 @@ mod tests {
         let req2 = ConnReq::new(client_id.clone(), connect2, handle2);
 
         broker.open_session(req1).unwrap();
-        assert_eq!(1, broker.sessions.len());
+        assert_eq!(1, broker.state.sessions.len());
 
         let result = broker.open_session(req2);
         assert_matches!(result, Err(SessionError::DuplicateSession(_, _)));
-        assert_matches!(broker.sessions[&client_id], Session::Persistent(_));
-        assert_eq!(1, broker.sessions.len());
+        assert_matches!(broker.state.sessions[&client_id], Session::Persistent(_));
+        assert_eq!(1, broker.state.sessions.len());
     }
 
     #[test]
@@ -1155,20 +1168,20 @@ mod tests {
 
         broker.open_session(req1).unwrap();
 
-        assert_eq!(1, broker.sessions.len());
-        assert_matches!(broker.sessions[&client_id], Session::Persistent(_));
+        assert_eq!(1, broker.state.sessions.len());
+        assert_matches!(broker.state.sessions[&client_id], Session::Persistent(_));
 
         // close session and check behavior
         let old_session = broker.close_session(&client_id);
         assert_matches!(old_session, Some(Session::Disconnecting(_)));
-        assert_eq!(1, broker.sessions.len());
-        assert_matches!(broker.sessions[&client_id], Session::Offline(_));
+        assert_eq!(1, broker.state.sessions.len());
+        assert_matches!(broker.state.sessions[&client_id], Session::Offline(_));
 
         // Reopen session
         broker.open_session(req2).unwrap();
 
-        assert_eq!(1, broker.sessions.len());
-        assert_matches!(broker.sessions[&client_id], Session::Persistent(_));
+        assert_eq!(1, broker.state.sessions.len());
+        assert_matches!(broker.state.sessions[&client_id], Session::Persistent(_));
     }
 
     #[test]
@@ -1183,21 +1196,21 @@ mod tests {
 
         broker.open_session(req1).unwrap();
 
-        assert_eq!(1, broker.sessions.len());
-        assert_matches!(broker.sessions[&client_id], Session::Persistent(_));
+        assert_eq!(1, broker.state.sessions.len());
+        assert_matches!(broker.state.sessions[&client_id], Session::Persistent(_));
 
         // close session and check behavior
         let old_session = broker.close_session(&client_id);
         assert_matches!(old_session, Some(Session::Disconnecting(_)));
-        assert_eq!(1, broker.sessions.len());
-        assert_matches!(broker.sessions[&client_id], Session::Offline(_));
+        assert_eq!(1, broker.state.sessions.len());
+        assert_matches!(broker.state.sessions[&client_id], Session::Offline(_));
 
         // Reopen session
         let connect2 = transient_connect(id.clone());
         let req2 = ConnReq::new(client_id.clone(), connect2, handle2);
         broker.open_session(req2).unwrap();
 
-        assert_eq!(1, broker.sessions.len());
-        assert_matches!(broker.sessions[&client_id], Session::Transient(_));
+        assert_eq!(1, broker.state.sessions.len());
+        assert_matches!(broker.state.sessions[&client_id], Session::Transient(_));
     }
 }
