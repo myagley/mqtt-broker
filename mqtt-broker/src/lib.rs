@@ -19,9 +19,10 @@ mod connection;
 mod error;
 mod server;
 mod session;
+mod snapshot;
 mod subscription;
 
-pub use crate::broker::BrokerState;
+pub use crate::broker::{Broker, BrokerState};
 pub use crate::connection::ConnectionHandle;
 pub use crate::error::{Error, ErrorKind};
 pub use crate::server::Server;

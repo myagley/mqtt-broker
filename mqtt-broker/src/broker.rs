@@ -20,6 +20,7 @@ macro_rules! try_send {
     }};
 }
 
+#[derive(Debug, Default)]
 pub struct BrokerState {
     sessions: HashMap<ClientId, Session>,
     retained: HashMap<String, proto::Publication>,
@@ -34,14 +35,10 @@ pub struct Broker {
 impl Broker {
     pub fn new() -> Self {
         let (sender, messages) = mpsc::channel(1024);
-        let state = BrokerState {
-            sessions: HashMap::new(),
-            retained: HashMap::new(),
-        };
         Self {
             sender,
             messages,
-            state,
+            state: BrokerState::default(),
         }
     }
 
