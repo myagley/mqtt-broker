@@ -21,7 +21,10 @@ macro_rules! try_send {
 }
 
 #[derive(Debug, Default)]
-pub struct BrokerState;
+pub struct BrokerState {
+    retained: HashMap<String, proto::Publication>,
+    sessions: Vec<SessionState>,
+}
 
 pub struct Broker {
     sender: Sender<Message>,
@@ -41,14 +44,19 @@ impl Broker {
         }
     }
 
-    pub fn from_state(_state: BrokerState) -> Self {
-        // TODO use the state
+    pub fn from_state(state: BrokerState) -> Self {
+        let BrokerState { retained, sessions } = state;
+        let sessions = sessions
+            .into_iter()
+            .map(|s| (s.client_id().clone(), Session::new_offline(s)))
+            .collect::<HashMap<ClientId, Session>>();
+
         let (sender, messages) = mpsc::channel(1024);
         Self {
             sender,
             messages,
-            sessions: HashMap::new(),
-            retained: HashMap::new(),
+            sessions,
+            retained,
         }
     }
 
@@ -94,7 +102,18 @@ impl Broker {
     }
 
     fn snapshot(&self) -> BrokerState {
-        BrokerState::default()
+        let retained = self.retained.clone();
+        let sessions = self
+            .sessions
+            .values()
+            .filter_map(|session| match session {
+                Session::Persistent(ref c) => Some(c.state().clone()),
+                Session::Offline(ref o) => Some(o.state().clone()),
+                _ => None,
+            })
+            .collect::<Vec<SessionState>>();
+
+        BrokerState { retained, sessions }
     }
 
     async fn process_message(

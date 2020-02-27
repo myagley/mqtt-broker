@@ -38,6 +38,10 @@ impl ConnectedSession {
         &self.handle
     }
 
+    pub fn state(&self) -> &SessionState {
+        &self.state
+    }
+
     pub fn into_will(self) -> Option<proto::Publication> {
         self.will
     }
@@ -158,6 +162,10 @@ impl OfflineSession {
 
     pub fn client_id(&self) -> &ClientId {
         &self.state.client_id
+    }
+
+    pub fn state(&self) -> &SessionState {
+        &self.state
     }
 
     pub fn publish_to(
@@ -298,6 +306,10 @@ impl SessionState {
             waiting_to_be_released: HashMap::new(),
             waiting_to_be_completed: HashSet::new(),
         }
+    }
+
+    pub fn client_id(&self) -> &ClientId {
+        &self.client_id
     }
 
     pub fn update_subscription(
